@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: AMUSE main page
+    url: https://www.amusecode.org/
+    about: Everything about AMUSE.
+  - name: AMUSE documentation
+    url: https://amuse.readthedocs.io/en/latest/
+    about: Documentation for latest version.
+  - name: AMUSE issue tracker
+    url: https://github.com/amusecode/amuse/issues
+    about: Report framework-level bugs upstream, not here.

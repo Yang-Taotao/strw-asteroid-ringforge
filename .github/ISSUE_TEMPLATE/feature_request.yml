@@ -1,0 +1,57 @@
+name: Feature request
+description: Suggest a new capability for ringforge.
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Feature requests are welcome. Please describe the scientific or
+        engineering need, not just the implementation.
+
+  - type: textarea
+    id: motivation
+    attributes:
+      label: Scientific or engineering motivation
+      description: What problem does this solve? Why is it needed?
+      placeholder: "To study rings around binaries with non-zero eccentricity, we need..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed approach
+      description: How you imagine this working. Sketches, API ideas, references — all welcome.
+    validations:
+      required: false
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Any workarounds or other approaches you have thought about.
+    validations:
+      required: false
+
+  - type: dropdown
+    id: scope
+    attributes:
+      label: Scope
+      options:
+        - New physics / community code
+        - New analysis or diagnostic
+        - New run configuration
+        - Performance / parallelism
+        - Documentation
+        - Other
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checklist
+      options:
+        - label: I have searched existing issues to avoid duplicates.
+          required: true
