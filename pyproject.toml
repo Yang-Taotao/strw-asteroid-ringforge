@@ -1,0 +1,12 @@
+[tool.ruff]
+target-version = "py313"
+line-length = 100
+src = ["src", "scripts"]
+extend-exclude = ["notebooks", "data", "docs"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
+extend-select = ["B", "N", "SIM", "NPY", "PTH", "ANN", "RUF"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["ringforge"]
