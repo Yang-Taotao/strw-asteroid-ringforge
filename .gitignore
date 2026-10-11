@@ -219,6 +219,7 @@ __marimo__/
 *__amuse_code_output/
 *.amuse
 data/
+dev/
 
 # misc
 *notes.md
