@@ -1,8 +1,4 @@
-<div align="center">
-
 # strw-asteroid-ringforge
-
-**Rubble-pile asteroid collisions, simulated with REBOUND and rendered to GIF.**
 
 [![Python](https://img.shields.io/badge/python-3.13-blue?logo=python&logoColor=white)](https://www.python.org/)
 [![Conda](https://img.shields.io/badge/env-conda--forge%2Fminiforge-green?logo=conda-forge&logoColor=white)](https://github.com/conda-forge/miniforge)
@@ -10,9 +6,9 @@
 [![AMUSE](https://img.shields.io/badge/interface-AMUSE-purple)](https://amusecode.github.io/)
 [![Status](https://img.shields.io/badge/status-active%20development-yellow)](https://shouldideploy.today/)
 
-*Settle, collide, and animate self-gravitating rubble piles to probe ring formation.*
+**Rubble-pile asteroid collisions, simulated with REBOUND and rendered to GIF.**
 
-</div>
+*Settle, collide, and animate self-gravitating rubble piles to probe ring formation.*
 
 ---
 
@@ -31,17 +27,16 @@
 
 ## Overview
 
-`strw-asteroid-ringforge` builds self-gravitating rubble-pile asteroids.
-This follows a power-law size distribution.
-We relax the rubble piles under their own gravity.
-Then we smash them together and renders the aftermath to an animated `gif`.
-
 > [!NOTE]
 > The name is a palce holder, we are investigating if rings around asteroids can form.
 >
 > Current sim written with native [`REBOUND`](https://github.com/hannorein/rebound).
 >
 > We aim to use `AMUSE` interface down the road for easy testing across multiple codes.
+
+1. We build self-gravitating rubble-pile asteroids from a power-law size distribution.
+2. We relax the rubble piles under their own gravity.
+3. We smash them together and renders the aftermath to an animated `gif`.
 
 ---
 
@@ -62,8 +57,7 @@ Then we smash them together and renders the aftermath to an animated `gif`.
    └────────────────┘     └────────────────┘     └────────────────┘
 ```
 
-Each stage is independently runnable and cached, so parameter sweeps can
-skip the expensive settlement step entirely once a state is on disk.
+Each stage is independently runnable and cached.
 
 ---
 
@@ -267,8 +261,58 @@ conda activate amuse-py313
 
 ---
 
-<div align="center">
+## Parameter space analysis
+
+We integrate backwards from potential collision to find the initial conditions.
+
+### 1. Example param space scan
+
+We make 10000 realisations of potential impacts across 16 workers with seed 42:
+
+```sh
+python param_scan.py --n 10000 \
+   --out data/param_scan_test \
+   --workers 16 --chunk 2000 --seed 42   
+```
+
+### 2. Example param space scan visualization and diagnostics
+
+The associated visualization and diagnostics plots is rendered by:
+
+```sh
+python param_plot.py data/param_scan_test \
+   --diagnostics media/param_scan_test_diag.png \
+   --out media/param_scan_test.png    
+```
+
+### 3. Parameter scan initial bullet locations
+
+![param_scan_test](./media/param_scan_test.png)
+
+### 4. Parameter scan results diagnostics
+
+![param_scan_test_diag](./media/param_scan_test_diag.png)
+
+---
+
+## Example collisions
+
+We have created some preliminary collision results to showcase here.
+
+### 1. Head on collisions
+
+Legacy setteling routine, settled asteroids appear to be in loose structures.
+
+![legacy 2-body collision](./media/bak/asteroid_collision_1.gif)
+
+### 2. Pseudo binary with incoming bullet - identical asteroids
+
+![pseudo 3-body collision - identical asteroids](./media/bak/asteroid_collision_13.gif)
+
+### 3. Pseudo binary with incoming bullet - different asteroids
+
+![pseudo 3-body collision - different asteroids](./media/gif_20261011_204608.gif)
+
+---
 
 **Built with coffee and tea at [STRW](https://www.strw.leidenuniv.nl/)**
-
-</div>
