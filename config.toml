@@ -1,0 +1,72 @@
+# ringforge configs
+#
+# Items are in SI units by default.
+
+[run]
+seed           = 42      # run-level seed; selects a realisation
+placement_seed = 42      # asteroid construction seed (part of the cache key)
+data_dir       = "data"
+media_dir      = "media"
+log_dir        = "logs"
+
+[bodies]
+ma                  = 1.0e15 # kg
+mb                  = 1.0e13 # kg
+mc                  = 1.0e12 # kg
+density             = 3000.0 # kg/m3
+n1                  = 2100   # particles in host 1         -> not used atm
+n2                  = 900    # particles in host 2         -> not used atm
+n3                  = 300    # particles in the bullet     -> not used atm
+size_slope          = -3.0   # dN/dr \sim r^slope for power law placement
+r_min               = 50.0   # m, base range at the M1 scale
+r_max               = 1000.0 # m, base range at the M1 scale
+packing_fraction    = 0.45
+max_rmax_over_rball = 0.30
+
+[binary]
+a_bin   = 1.0e4 # m
+e_bin   = 0.0   # circular
+inc_bin = 0.0   # rad
+v_rel   = 100.0 # m/s, bullet speed at contact in param scan
+
+[settle]
+settle_time        = 108000.0   # s
+dt                 = 10.0       # s, used for leapfrog integrator during settling
+softening          = 20.0       # m, regularizes sub-particle close encounters
+integrator         = "leapfrog"
+chunks             = 10
+max_substeps       = 100
+dt_safety          = 0.10
+min_bound_fraction = 0.98
+max_extent_factor  = 3.0
+
+[impact]
+bullet_speed       = 100.0      # m/s, fixed-geometry path
+post_impact_tail   = 18000.0    # s
+dt                 = 1.0        # s
+steps_per_frame    = 5          # simulation steps between rendered frames
+integrator         = "leapfrog"
+bound_radius_a_bin = 1.0
+bound_check_every  = 100
+
+[render]
+color_mode            = "gray" # "gray" | "rgb"
+media_format          = "mp4"  # "gif" | "mp4" | "both"
+video_fps             = 20
+video_crf             = 20
+gif_duration_ms       = 50
+gif_quantize_colors   = 128
+view_percentile       = 95.0
+min_half_extent_km    = 10.0
+max_half_extent_a_bin = 2.0
+fig_size_in           = 8.0
+render_dpi            = 100
+
+[scan]
+geometry  = "uniform"              # "uniform" | "flux"
+phase     = "random"               # "random" | "fixed"
+n         = 10000
+out       = "data/param_scan_test"
+chunk     = 2000
+workers   = 16
+lookbacks = [0.01, 0.1, 1.0, 10.0] # lookback time in units of T_bin
