@@ -1,6 +1,6 @@
 [tool.ruff]
 target-version = "py313"
-line-length = 100
+line-length = 88
 src = ["src", "scripts"]
 extend-exclude = ["notebooks", "data", "docs"]
 
