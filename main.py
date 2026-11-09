@@ -13,10 +13,26 @@ cfgs:
     Parse from `config.toml` (read through `config.py`)
 
 CLI:
+    // parse in param scan results and do one sim with param idx 42
+    // and gen movie from lookback time 0.01 t_bin
     python main.py \
         --param-path data/param_scan_test/ --param-index 42 \
         --particles-per-body 1000 --look-back 0.01 
-    python main.py --rebuild-gif data/collision_frames_XXX
+    // run one simulation with ma, mb, mc mass specified
+    // run with 1000 particles per body
+    // and with the primary body ma resolved as rubble pile instead of a single particle
+    python main.py \
+        --ma 1e15 --mb 1e13 --mc 1e12 \
+        --particles-per-body 1000 \
+        --resolve-primary
+    // run several simulations to trace the mass/impact-parameter relation
+    // the default grid is 0.00..2.00 in steps of 0.05
+    python main.py --impact-scan \
+        --ma 1e15 --mb 1e13 --mc 1e12 \
+        --impact-out media/impact_scan.png
+    // skip frames/video for a batch run; only write the result JSON
+    python main.py --param-path data/param_scan_test/ --param-index 42 \
+        --no-media --case-scan-target 0.5 --case-scan-out case.json
 """
 
 from __future__ import annotations
@@ -50,7 +66,7 @@ from matplotlib.axes import Axes
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.figure import Figure
 from PIL import Image
-from scipy.constants import G as _G
+from scipy.constants import G as _G  # type: ignore
 from tqdm import tqdm
 
 # logger init
@@ -144,6 +160,7 @@ STEPS_PER_FRAME_HIT: int = int(_cfg("impact", "steps_per_frame", 5))
 
 SEPARATION_FACTOR: float = 6.0
 BULLET_SPEED: float = float(_cfg("impact", "bullet_speed", 100.0))  # m/s
+DEFAULT_IMPACT_PARAMETERS: list[float] = [0.05 * index for index in range(41)]
 BOX_SIZE_FACTOR: float = 32.0
 POST_IMPACT_TAIL: float = float(_cfg("impact", "post_impact_tail", 18000.0))  # s
 
@@ -786,6 +803,29 @@ def build_asteroid(
 def state_extent(positions: np.ndarray) -> float:
     """Return the largest side length of the particle bounding box"""
     return float(np.max(np.ptp(positions, axis=0)))
+
+
+def body_radius(state: np.ndarray) -> float:
+    """Return the radius of one body about its COM"""
+    state = np.asarray(state, float)
+    if state.ndim != 2 or state.shape[1] != 7 or state.shape[0] == 0:
+        raise ValueError("state must have shape (N, 7) with N > 0")
+    masses = np.asarray(mass_from_radius(state[:, 6]), float)
+    com_pos, _, _ = _com_state(masses, state[:, :3], state[:, 3:6])
+    distances = np.linalg.norm(state[:, :3] - com_pos, axis=1) + state[:, 6]
+    return float(distances.max())
+
+
+def single_particle_state(
+    target_mass: float,
+    *,
+    density: float = PARTICLE_DENSITY,
+) -> np.ndarray:
+    """Return single particle primary host build"""
+    if target_mass <= 0 or density <= 0:
+        raise ValueError("target_mass and density must be positive")
+    radius = float((3.0 * target_mass / (4.0 * np.pi * density)) ** (1.0 / 3.0))
+    return np.asarray([[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, radius]], float)
 
 
 def _com_state(
@@ -1562,13 +1602,21 @@ def build_scene_fixed(
     integrator: str,
     softening: float,
     bullet_speed: float = BULLET_SPEED,
+    impact_parameter: float = 0.0,
 ) -> tuple[rebound.Simulation, float, float, float, int, float, float]:
     """
     Build the fixed-geometry scene
 
+    `impact_parameter`
+        Offsets the bullet perpendicular to its velocity.
+
     Returns `sim, a_bin, t_bin, t_impact, n_host, separation, a_extent`
     """
-    extent1 = state_extent(state1[:, :3])  # host 1
+    if state1.shape[0] == 1:
+        primary_mass = float(mass_from_radius(state1[0, 6], density))
+        extent1 = 2.0 * ball_radius_for_mass(primary_mass, density=density)
+    else:
+        extent1 = state_extent(state1[:, :3])  # host 1
     extent2 = state_extent(state2[:, :3])  # host 2
     extent3 = state_extent(state3[:, :3])  # bullet
     a_extent, separation, box_size = get_scene_params(extent1, extent2, extent3)
@@ -1596,7 +1644,7 @@ def build_scene_fixed(
     add_settled_fixed(
         sim,
         state3,
-        OFFSET_3 * separation,
+        OFFSET_3 * separation + np.asarray([0.0, impact_parameter, 0.0]),
         BLKVEL_3 * bullet_speed,
         density=density,
     )
@@ -1607,7 +1655,8 @@ def build_scene_fixed(
         + np.asarray(mass_from_radius(state2[:, 6], density)).sum()
     )
     t_bin = float(2.0 * np.pi * np.sqrt(a_bin**3 / (G * m_host)))
-    t_impact = float((separation - a_extent) / bullet_speed)
+    closing_speed = float((BLKVEL_3[0] - BLKVEL_2[0]) * bullet_speed)
+    t_impact = float((separation - a_extent) / closing_speed)
     return sim, a_bin, t_bin, t_impact, state1.shape[0], separation, a_extent
 
 
@@ -1765,6 +1814,361 @@ def bound_debris_stats(
         f"median r={stats['median_r'] / 1000:.1f} km",
     )
     return stats
+
+
+# ==================================================================================== #
+# Impact products
+# ==================================================================================== #
+
+
+def _bound_core_indices(
+    masses: np.ndarray,
+    positions: np.ndarray,
+    velocities: np.ndarray,
+    *,
+    max_iter: int = 8,
+) -> np.ndarray:
+    """Return the iteratively bound core of a set of particles"""
+    indices = np.arange(masses.size)
+    for _ in range(max_iter):
+        if indices.size == 0:
+            break
+        com_pos, com_vel, total = _com_state(
+            masses[indices], positions[indices], velocities[indices]
+        )
+        rel_r = positions[indices] - com_pos
+        rel_v = velocities[indices] - com_vel
+        r = np.linalg.norm(rel_r, axis=1)
+        energy = 0.5 * (rel_v**2).sum(axis=1) - G * total / np.maximum(r, 1e-9)
+        bound = energy < 0.0
+        if bound.all():
+            break
+        indices = indices[bound]
+    return indices
+
+
+def _orbital_elements(
+    rel_positions: np.ndarray,
+    rel_velocities: np.ndarray,
+    *,
+    mu: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Return `a [m], e, i [deg], valid` for relative conic orbits"""
+    if mu <= 0:
+        raise ValueError("mu must be positive")
+    rel_positions = np.asarray(rel_positions, float)
+    rel_velocities = np.asarray(rel_velocities, float)
+    if rel_positions.size == 0:
+        empty: np.ndarray = np.asarray([], dtype=float)
+        empty_bool: np.ndarray = np.asarray([], dtype=bool)
+        return empty, empty, empty, empty_bool
+
+    r = np.linalg.norm(rel_positions, axis=1)
+    h = np.cross(rel_positions, rel_velocities)
+    h_norm = np.linalg.norm(h, axis=1)
+    energy = 0.5 * (rel_velocities**2).sum(axis=1) - mu / np.maximum(r, 1e-9)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        a = -mu / (2.0 * energy)
+        e_vec = (
+            np.cross(rel_velocities, h) / mu
+            - rel_positions / np.maximum(r, 1e-9)[:, None]
+        )
+    e = np.linalg.norm(e_vec, axis=1)
+    inc = np.degrees(np.arccos(np.clip(h[:, 2] / np.maximum(h_norm, 1e-9), -1.0, 1.0)))
+    valid = np.isfinite(a) & np.isfinite(e) & np.isfinite(inc) & (h_norm > 0.0)
+    return a, e, inc, valid
+
+
+def collision_product_stats(
+    sim: rebound.Simulation,
+    *,
+    n_host: int,
+    n_secondary: int,
+    n_bullet: int,
+) -> dict[str, Any]:
+    """
+    Split the secondary's material into remnant, ring, and debris
+
+    `Host 1`
+        The central particle and primary host
+
+    `Host 2`
+        Iteratively reduced to its bound core:
+        stripped material bound to `host 1` -> ring
+        stripped material unbound to `host 1` and `host 2` -> debris
+
+    `Bullet`
+        Tracked separately and excluded from the three mass curves
+
+    Orbital elements are computed for every stripped secondary particle
+        relative to the primary, the bound subset is the Keplerian ring.
+    """
+    expected = n_host + n_secondary + n_bullet
+    if expected != sim.N:
+        raise ValueError(f"expected {expected} particles, found {sim.N}")
+    if n_host <= 0 or n_secondary <= 0 or n_bullet <= 0:
+        raise ValueError("particle counts must be positive")
+
+    masses = np.asarray([particle.m for particle in sim.particles], float)
+    positions = np.asarray(
+        [[particle.x, particle.y, particle.z] for particle in sim.particles],
+        float,
+    )
+    velocities = np.asarray(
+        [[particle.vx, particle.vy, particle.vz] for particle in sim.particles],
+        float,
+    )
+
+    primary_idx = np.arange(0, n_host)
+    secondary_idx = np.arange(n_host, n_host + n_secondary)
+    bullet_idx = np.arange(n_host + n_secondary, expected)
+    primary_pos, primary_vel, primary_mass = _com_state(
+        masses[primary_idx], positions[primary_idx], velocities[primary_idx]
+    )
+
+    core_idx = _bound_core_indices(
+        masses[secondary_idx],
+        positions[secondary_idx],
+        velocities[secondary_idx],
+    )
+    is_secondary = np.zeros(sim.N, dtype=bool)
+    is_secondary[secondary_idx[core_idx]] = True
+    ejecta_idx = secondary_idx[~is_secondary[secondary_idx]]
+
+    rel_r = positions[ejecta_idx] - primary_pos
+    rel_v = velocities[ejecta_idx] - primary_vel
+    r = np.linalg.norm(rel_r, axis=1)
+    energy = 0.5 * (rel_v**2).sum(axis=1) - G * primary_mass / np.maximum(r, 1e-9)
+    ring_mask = energy < 0.0
+    ring_idx = ejecta_idx[ring_mask]
+    debris_idx = ejecta_idx[~ring_mask]
+
+    a, e, inc, valid = _orbital_elements(rel_r, rel_v, mu=G * primary_mass)
+    bound = valid & (a > 0.0) & (e < 1.0)
+
+    mass_ring = float(masses[ring_idx].sum())
+    mass_debris = float(masses[debris_idx].sum())
+    mass_secondary = float(masses[secondary_idx[core_idx]].sum())
+    mass_secondary_total = float(masses[secondary_idx].sum())
+    if not np.isclose(mass_ring + mass_debris + mass_secondary, mass_secondary_total):
+        raise RuntimeError("secondary mass is not conserved by the classification")
+
+    median_a = float(np.median(a[bound])) if bound.any() else float("nan")
+    median_e = float(np.median(e[bound])) if bound.any() else float("nan")
+    median_inc = float(np.median(inc[bound])) if bound.any() else float("nan")
+    return {
+        "mass_ring_kg": mass_ring,
+        "mass_debris_kg": mass_debris,
+        "mass_secondary_kg": mass_secondary,
+        "mass_secondary_total_kg": mass_secondary_total,
+        "mass_bullet_kg": float(masses[bullet_idx].sum()),
+        "n_ring": int(ring_idx.size),
+        "n_debris": int(debris_idx.size),
+        "n_secondary": int(core_idx.size),
+        "n_bullet": int(bullet_idx.size),
+        "n_ejecta": int(ejecta_idx.size),
+        "n_valid_orbit": int(valid.sum()),
+        "n_bound_orbit": int(bound.sum()),
+        "median_a_m": median_a,
+        "median_e": median_e,
+        "median_inc_deg": median_inc,
+        "orbital_a_m": a,
+        "orbital_e": e,
+        "orbital_inc_deg": inc,
+        "orbital_valid": valid,
+        "orbital_bound": bound,
+    }
+
+
+def plot_impact_scan(
+    rows: list[dict[str, Any]],
+    out_path: str | Path,
+    *,
+    secondary_radius: float,
+    bullet_radius: float,
+) -> None:
+    """Plot ring, debris, and secondary host mass against impact parameter"""
+    out_path = Path(out_path)
+    b = np.asarray([row["impact_parameter_r2"] for row in rows], float)
+    series = (
+        ("mass_ring_kg", "o-", "C0", "ring (bound to primary)"),
+        ("mass_debris_kg", "s-", "C1", "debris (unbound)"),
+        ("mass_secondary_kg", "^-", "C2", "secondary remnant"),
+    )
+    fig, ax = plt.subplots(figsize=(FIG_SIZE_IN, 0.62 * FIG_SIZE_IN))
+    targets = [row.get("impact_target_r2") for row in rows]
+    if all(target is not None for target in targets):
+        target_values = np.asarray(targets, float)
+        for key, marker, color, label in series:
+            y = np.asarray([float(row[key]) for row in rows])
+            mean = np.asarray(
+                [y[target_values == value].mean() for value in np.unique(target_values)]
+            )
+            low = np.asarray(
+                [y[target_values == value].min() for value in np.unique(target_values)]
+            )
+            high = np.asarray(
+                [y[target_values == value].max() for value in np.unique(target_values)]
+            )
+            ax.errorbar(
+                np.unique(target_values),
+                mean,
+                yerr=np.vstack((mean - low, high - mean)),
+                fmt=marker,
+                color=color,
+                capsize=2,
+                label=label,
+            )
+        b = target_values
+    else:
+        for key, marker, color, label in series:
+            ax.plot(b, [row[key] for row in rows], marker, color=color, label=label)
+    contact = 1.0 + bullet_radius / secondary_radius
+    if b.min() <= contact <= b.max():
+        ax.axvline(contact, color="0.35", ls="--", lw=0.9, label="contact")
+    ax.set_xlabel(r"impact parameter $b/R_\mathrm{secondary}$")
+    ax.set_xlim(left=0.0)
+    ax.set_ylabel("mass [kg]")
+    ax.set_title("Secondary-host material after impact")
+    ax.grid(alpha=0.25)
+    ax.legend(fontsize=8)
+    ax.text(
+        0.02,
+        0.98,
+        f"$R_\\mathrm{{secondary}}$ = {secondary_radius / 1000:.2f} km",
+        transform=ax.transAxes,
+        va="top",
+        fontsize=8,
+    )
+    fig.tight_layout()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+
+def run_impact_scan(
+    args: argparse.Namespace,
+    state1: np.ndarray,
+    state2: np.ndarray,
+    state3: np.ndarray,
+    *,
+    target_masses: tuple[float, float, float],
+    n_particles: tuple[int, int, int],
+    run_id: str,
+) -> None:
+    """Integrate one collision per impact parameter and write the mass curves"""
+    secondary_radius = body_radius(state2)
+    bullet_radius = body_radius(state3)
+    if secondary_radius <= 0:
+        raise SystemExit("secondary body has zero radius")
+    out_path = Path(args.impact_out)
+    if out_path.suffix.lower() not in (".png", ".pdf"):
+        raise SystemExit("--impact-out must end in .png or .pdf")
+
+    rows: list[dict[str, Any]] = []
+    ejecta_index: list[int] = []
+    ejecta_a: list[np.ndarray] = []
+    ejecta_e: list[np.ndarray] = []
+    ejecta_inc: list[np.ndarray] = []
+    ejecta_valid: list[np.ndarray] = []
+    ejecta_bound: list[np.ndarray] = []
+    a_bin = 0.0
+
+    for b_r2 in args.impact_parameters:
+        b = float(b_r2) * secondary_radius
+        sim, a_bin, _t_bin, t_impact, _n_host, _sep, _extent = build_scene_fixed(
+            state1,
+            state2,
+            state3,
+            density=args.density,
+            dt=args.dt_hit,
+            integrator=args.hit_integrator,
+            softening=args.softening,
+            bullet_speed=args.bullet_speed,
+            impact_parameter=b,
+        )
+        t_max = 2.0 * t_impact + float(args.post_impact_tail)
+        if t_max <= 0:
+            raise SystemExit("impact scan t_max is not positive")
+        while sim.t < t_max - 1e-9:
+            t_next = min(sim.t + max(1.0, 100.0 * sim.dt), t_max)
+            sim.integrate(t_next)
+            align_root_size(sim)
+
+        stats = collision_product_stats(
+            sim,
+            n_host=state1.shape[0],
+            n_secondary=state2.shape[0],
+            n_bullet=state3.shape[0],
+        )
+        row = {
+            "impact_parameter_m": b,
+            "impact_parameter_r2": float(b_r2),
+            **{
+                key: value
+                for key, value in stats.items()
+                if not isinstance(value, np.ndarray)
+            },
+        }
+        rows.append(row)
+        ejecta_index.extend([len(rows) - 1] * stats["orbital_a_m"].size)
+        ejecta_a.append(stats["orbital_a_m"])
+        ejecta_e.append(stats["orbital_e"])
+        ejecta_inc.append(stats["orbital_inc_deg"])
+        ejecta_valid.append(stats["orbital_valid"])
+        ejecta_bound.append(stats["orbital_bound"])
+        log_info(
+            f"         b/R2={b_r2:5.2f}  "
+            f"ring={stats['mass_ring_kg']:.3e} kg  "
+            f"debris={stats['mass_debris_kg']:.3e} kg  "
+            f"secondary={stats['mass_secondary_kg']:.3e} kg"
+        )
+
+    if not rows:
+        raise SystemExit("impact scan produced no points")
+
+    def cat(parts: list[np.ndarray]) -> np.ndarray:
+        return np.concatenate(parts) if parts else np.asarray([], float)
+
+    data_path = DATA_DIR / f"impact_scan_{run_id}.npz"
+    np.savez(
+        data_path,
+        impact_parameter_m=np.asarray([row["impact_parameter_m"] for row in rows]),
+        impact_parameter_r2=np.asarray([row["impact_parameter_r2"] for row in rows]),
+        mass_ring_kg=np.asarray([row["mass_ring_kg"] for row in rows]),
+        mass_debris_kg=np.asarray([row["mass_debris_kg"] for row in rows]),
+        mass_secondary_kg=np.asarray([row["mass_secondary_kg"] for row in rows]),
+        mass_bullet_kg=np.asarray([row["mass_bullet_kg"] for row in rows]),
+        ejecta_impact_index=np.asarray(ejecta_index, int),
+        ejecta_a_m=cat(ejecta_a),
+        ejecta_e=cat(ejecta_e),
+        ejecta_inc_deg=cat(ejecta_inc),
+        ejecta_valid=cat(ejecta_valid).astype(bool),
+        ejecta_bound=cat(ejecta_bound).astype(bool),
+    )
+    payload = {
+        **collect_metadata(),
+        "run_id": run_id,
+        "primary_mode": "single" if state1.shape[0] == 1 else "resolved",
+        "target_masses": list(target_masses),
+        "n_particles": list(n_particles),
+        "secondary_radius_m": secondary_radius,
+        "bullet_radius_m": bullet_radius,
+        "contact_impact_parameter_r2": 1.0 + bullet_radius / secondary_radius,
+        "a_bin_m": a_bin,
+        "bullet_speed_m_s": args.bullet_speed,
+        "post_impact_tail_s": args.post_impact_tail,
+        "rows": rows,
+    }
+    atomic_write_json(DATA_DIR / f"impact_scan_{run_id}.json", payload)
+    plot_impact_scan(
+        rows,
+        out_path,
+        secondary_radius=secondary_radius,
+        bullet_radius=bullet_radius,
+    )
+    log_info(f"\n         Impact scan data  -> {data_path}")
+    log_info(f"         Impact scan plot  -> {out_path}")
 
 
 # ==================================================================================== #
@@ -2225,6 +2629,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "settled body, changing --seed does not",
     )
     parser.add_argument("--no-parallel-settle", action="store_true")
+    parser.add_argument(
+        "--resolve-primary",
+        action="store_true",
+        help="resolve host 1 as a rubble pile instead of a single particle",
+    )
 
     parser.add_argument("--param-path", type=str, default=None)
     parser.add_argument("--param-index", type=int, default=None)
@@ -2234,6 +2643,37 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         choices=("contact", "lookback"),
         default="contact",
         help="contact = state_0 at t=0; lookback = selected -look_back snapshot",
+    )
+    parser.add_argument(
+        "--impact-scan",
+        action="store_true",
+        help="run the impact-parameter scan",
+    )
+    parser.add_argument(
+        "--impact-parameters",
+        nargs="+",
+        type=float,
+        default=DEFAULT_IMPACT_PARAMETERS,
+        metavar="B/R2",
+        help="impact parameters in units of the secondary host radius",
+    )
+    parser.add_argument(
+        "--impact-out",
+        type=str,
+        default="media/impact_scan.png",
+        help="scan plot path",
+    )
+    parser.add_argument(
+        "--case-scan-out",
+        type=str,
+        default=None,
+        help="parameter-scan plot path",
+    )
+    parser.add_argument(
+        "--case-scan-target",
+        type=float,
+        default=None,
+        help="target impact parameter for a grouped case-scan selection",
     )
 
     parser.add_argument("--particles-per-body", type=int, default=None)
@@ -2305,6 +2745,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         choices=("gif", "mp4", "both"),
         default=MEDIA_FORMAT,
         help="write a GIF, an MP4, or both",
+    )
+    parser.add_argument(
+        "--no-media",
+        action="store_true",
+        help="skip frame rendering and video/gif encoding",
     )
     parser.add_argument(
         "--color-mode",
@@ -2408,6 +2853,27 @@ def main(argv: list[str] | None = None) -> None:
         raise SystemExit("--fig-size-in and --render-dpi must be positive")
     if not 0 <= args.video_crf <= 51:
         raise SystemExit("--video-crf must be in [0, 51]")
+    if args.impact_scan and args.param_path is not None:
+        raise SystemExit("--impact-scan does not support --param-path")
+    if args.impact_scan:
+        if not args.impact_parameters:
+            raise SystemExit("--impact-parameters must not be empty")
+        if any(not np.isfinite(b) or b < 0.0 for b in args.impact_parameters):
+            raise SystemExit("--impact-parameters must be finite and non-negative")
+        if Path(args.impact_out).suffix.lower() not in (".png", ".pdf"):
+            raise SystemExit("--impact-out must end in .png or .pdf")
+    if args.case_scan_out is not None:
+        if args.impact_scan:
+            raise SystemExit("--case-scan-out does not support --impact-scan")
+        if args.param_path is None:
+            raise SystemExit("--case-scan-out requires --param-path")
+        if Path(args.case_scan_out).suffix.lower() != ".json":
+            raise SystemExit("--case-scan-out must end in .json")
+    if args.case_scan_target is not None:
+        if args.case_scan_out is None:
+            raise SystemExit("--case-scan-target requires --case-scan-out")
+        if not np.isfinite(args.case_scan_target) or args.case_scan_target < 0.0:
+            raise SystemExit("--case-scan-target must be finite and non-negative")
 
     # resolve masses
     realisation: dict[str, Any] | None = None
@@ -2434,11 +2900,14 @@ def main(argv: list[str] | None = None) -> None:
     else:
         target_masses = (float(args.ma), float(args.mb), float(args.mc))
 
-    n_particles = (
-        (int(args.particles_per_body),) * 3
-        if args.particles_per_body is not None
-        else (int(args.n1), int(args.n2), int(args.n3))
-    )
+    if args.particles_per_body is not None:
+        n2 = n3 = int(args.particles_per_body)
+        n1 = int(args.particles_per_body) if args.resolve_primary else 1
+    else:
+        n1 = int(args.n1) if args.resolve_primary else 1
+        n2 = int(args.n2)
+        n3 = int(args.n3)
+    n_particles = (n1, n2, n3)
     if any(n <= 0 for n in n_particles):
         raise SystemExit("particle counts must be positive")
     if any(mass <= 0 for mass in target_masses):
@@ -2458,11 +2927,23 @@ def main(argv: list[str] | None = None) -> None:
         f"placement_seed={args.placement_seed}  density={args.density}  "
         f"settle_integrator={args.settle_integrator}  "
         f"softening={args.softening:g} m  bullet_speed={args.bullet_speed:g} m/s  "
+        f"primary={'resolved' if args.resolve_primary else 'single-particle'}  "
         f"media={args.media_format}",
     )
     log_info("Target bodies:")
     radius_ratios: list[float] = []
-    for label, mass, n in zip(labels, target_masses, n_particles, strict=True):
+    for index, (label, mass, n) in enumerate(
+        zip(labels, target_masses, n_particles, strict=True)
+    ):
+        if index == 0 and not args.resolve_primary:
+            radius_ratios.append(1.0)
+            radius = single_particle_state(mass, density=args.density)[0, 6]
+            log_info(
+                f"         {label:8s} M={mass:.3e} kg  "
+                f"single particle R={radius:.1f} m  "
+                "(use --resolve-primary for the rubble pile)"
+            )
+            continue
         if args.radius_ratio is not None:
             ratio = float(args.radius_ratio)
         else:
@@ -2471,12 +2952,16 @@ def main(argv: list[str] | None = None) -> None:
         describe_body(label, mass, n, ratio, density=args.density)
 
     # settle if none are saved already
-    log_info("\nStage 1: build/settle/reuse three rubble piles")
-    settled_paths: list[Path] = []
+    log_info("\nStage 1: build/settle/reuse collision bodies")
+    settled_paths: list[Path | None] = []
     jobs: list[dict[str, Any]] = []
     for label, mass, n, seed, ratio in zip(
         labels, target_masses, n_particles, seeds, radius_ratios, strict=True
     ):
+        if label == "host 1" and not args.resolve_primary:
+            settled_paths.append(None)
+            log_info("         host 1: no settled cache needed")
+            continue
         path = settled_path(
             mass,
             n,
@@ -2542,11 +3027,18 @@ def main(argv: list[str] | None = None) -> None:
     log_info("\n         settlement stage complete")
 
     states: list[np.ndarray] = []
-    for label, mass, n, path in zip(
+    for label, mass, n, cache_path in zip(
         labels, target_masses, n_particles, settled_paths, strict=True
     ):
+        if cache_path is None:
+            state = single_particle_state(mass, density=args.density)
+            states.append(state)
+            log_info(
+                f"\n         Loaded {label}: single particle (R={state[0, 6]:.1f} m)"
+            )
+            continue
         state, _extent, meta = load_settled_asteroid(
-            path,
+            cache_path,
             expected={
                 "target_mass": mass,
                 "target_n": n,
@@ -2556,7 +3048,7 @@ def main(argv: list[str] | None = None) -> None:
             density=args.density,
         )
         states.append(state)
-        log_info(f"\n         Loaded {label}: {path.name}")
+        log_info(f"\n         Loaded {label}: {cache_path.name}")
         r_lo = meta.get("r_lo")
         r_hi = meta.get("r_hi")
         check_powerlaw(
@@ -2569,6 +3061,18 @@ def main(argv: list[str] | None = None) -> None:
         state_diagnostics(state, density=args.density, label=label)
 
     state1, state2, state3 = states
+
+    if args.impact_scan:
+        run_impact_scan(
+            args,
+            state1,
+            state2,
+            state3,
+            target_masses=target_masses,
+            n_particles=n_particles,
+            run_id=run_id,
+        )
+        return
 
     # build collision case
     log_info("\nStage 2: build collision scene")
@@ -2690,7 +3194,9 @@ def main(argv: list[str] | None = None) -> None:
         "run_seed": int(args.seed),
         "placement_seed": int(args.placement_seed),
         "radius_ratios": list(radius_ratios),
-        "settled_paths": [str(path) for path in settled_paths],
+        "settled_paths": [
+            str(path) if path is not None else None for path in settled_paths
+        ],
         "a_bin": a_bin,
         "t_bin": t_bin,
         "t_impact": t_impact,
@@ -2707,29 +3213,40 @@ def main(argv: list[str] | None = None) -> None:
     log_info("\nStage 3: run sim and cache frames")
     gif_path = GIF_DIR / f"{GIF_STEM}_{run_id}.gif"
     video_path = VID_DIR / f"{VID_STEM}_{run_id}.mp4"
-    save_gif = args.media_format in ("gif", "both")
-    save_video = args.media_format in ("mp4", "both")
+    media_enabled = not args.no_media
+    save_gif = media_enabled and args.media_format in ("gif", "both")
+    save_video = media_enabled and args.media_format in ("mp4", "both")
     grayscale = args.color_mode == "gray"
     stream_video = save_video and not save_gif and not args.keep_frames
-    if stream_video:
+    if args.no_media:
+        log_info("         media mode: disabled by --no-media")
+    elif stream_video:
         log_info(
             "         media mode: streaming MP4; no frame chunks are written",
         )
     chunks_dir: Path | None = None
-    if not stream_video:
+    if media_enabled and not stream_video:
         chunks_dir = DATA_DIR / f"collision_frames_{run_id}"
         chunks_dir.mkdir(parents=True, exist_ok=True)
 
-    fig, ax, canvas, circles = make_canvas(
-        sim,
-        fig_size_in=args.fig_size_in,
-        dpi=args.render_dpi,
-    )
+    fig: Any = None
+    ax: Any = None
+    canvas: Any = None
+    circles: list[Any] = []
+    if media_enabled:
+        fig, ax, canvas, circles = make_canvas(
+            sim,
+            fig_size_in=args.fig_size_in,
+            dpi=args.render_dpi,
+        )
     frames_buf: list[np.ndarray] = []
     chunk_paths: list[Path] = []
     chunk_idx = 0
     frame_idx = 0
-    t0_wall = time.time()
+    t0_wall = time.perf_counter()
+    sim_wall = 0.0
+    render_wall = 0.0
+    media_wall = 0.0
 
     def flush_chunk() -> None:
         nonlocal frames_buf, chunk_idx
@@ -2745,43 +3262,46 @@ def main(argv: list[str] | None = None) -> None:
         frames_buf = []
         chunk_idx += 1
 
-    # Frame 000 explicitly, with a blank-frame check.
-    frame0 = render_frame_rgb(
-        canvas,
-        ax,
-        circles,
-        sim,
-        sim.t,
-        0,
-        min_half=min_half_m,
-        max_half=max_half_m,
-        view_percentile=args.view_percentile,
-        grayscale=grayscale,
-    )
-    non_white = int((frame0.mean(axis=-1) < 200).sum())
-    frac = non_white / float(frame0.shape[0] * frame0.shape[1])
-    log_debug(
-        f"         frame 000: shape={frame0.shape} mean={frame0.mean():.1f} "
-        f"non_white={frac:.4f}",
-    )
-    if frac == 0.0:
-        log_warning("         frame 000 is blank")
     video_writer: FFmpegVideoWriter | None = None
-    if stream_video:
-        video_writer = FFmpegVideoWriter(
-            video_path,
-            int(frame0.shape[1]),
-            int(frame0.shape[0]),
-            fps=args.video_fps,
-            crf=args.video_crf,
+    if media_enabled:
+        # Frame 000 explicitly, with a blank-frame check.
+        render_start = time.perf_counter()
+        frame0 = render_frame_rgb(
+            canvas,
+            ax,
+            circles,
+            sim,
+            sim.t,
+            0,
+            min_half=min_half_m,
+            max_half=max_half_m,
+            view_percentile=args.view_percentile,
             grayscale=grayscale,
         )
-        video_writer.write(frame0)
-    else:
-        frames_buf.append(frame0)
-    frame_idx = 1
-    if not stream_video and len(frames_buf) >= args.chunk_size:
-        flush_chunk()
+        render_wall += time.perf_counter() - render_start
+        non_white = int((frame0.mean(axis=-1) < 200).sum())
+        frac = non_white / float(frame0.shape[0] * frame0.shape[1])
+        log_debug(
+            f"         frame 000: shape={frame0.shape} mean={frame0.mean():.1f} "
+            f"non_white={frac:.4f}",
+        )
+        if frac == 0.0:
+            log_warning("         frame 000 is blank")
+        if stream_video:
+            video_writer = FFmpegVideoWriter(
+                video_path,
+                int(frame0.shape[1]),
+                int(frame0.shape[0]),
+                fps=args.video_fps,
+                crf=args.video_crf,
+                grayscale=grayscale,
+            )
+            video_writer.write(frame0)
+        else:
+            frames_buf.append(frame0)
+        frame_idx = 1
+        if not stream_video and len(frames_buf) >= args.chunk_size:
+            flush_chunk()
 
     rate: float | None = None
     eta_wall: float | None = None
@@ -2802,38 +3322,49 @@ def main(argv: list[str] | None = None) -> None:
                 sim.t + args.steps_per_frame * args.dt_hit,
                 t_max,
             )
+            sim_start = time.perf_counter()
             sim.integrate(t_next)
+            sim_wall += time.perf_counter() - sim_start
             align_root_size(sim)
             delta = max(0.0, float(sim.t) - last_t)
             progress.update(min(delta, float(progress.total) - progress.n))
             last_t = float(sim.t)
 
-            if len(circles) != sim.N:
-                plt.close(fig)
-                fig, ax, canvas, circles = make_canvas(
-                    sim,
-                    fig_size_in=args.fig_size_in,
-                    dpi=args.render_dpi,
-                )
+            if media_enabled:
+                if len(circles) != sim.N:
+                    plt.close(fig)
+                    fig, ax, canvas, circles = make_canvas(
+                        sim,
+                        fig_size_in=args.fig_size_in,
+                        dpi=args.render_dpi,
+                    )
 
-            rendered = render_frame_rgb(
-                canvas,
-                ax,
-                circles,
-                sim,
-                sim.t,
-                frame_idx,
-                min_half=min_half_m,
-                max_half=max_half_m,
-                view_percentile=args.view_percentile,
-                grayscale=grayscale,
-            )
-            if video_writer is not None:
-                video_writer.write(rendered)
-            else:
-                frames_buf.append(rendered)
+                render_start = time.perf_counter()
+                rendered = render_frame_rgb(
+                    canvas,
+                    ax,
+                    circles,
+                    sim,
+                    sim.t,
+                    frame_idx,
+                    min_half=min_half_m,
+                    max_half=max_half_m,
+                    view_percentile=args.view_percentile,
+                    grayscale=grayscale,
+                )
+                if video_writer is not None:
+                    encode_start = time.perf_counter()
+                    video_writer.write(rendered)
+                    media_wall += time.perf_counter() - encode_start
+                else:
+                    frames_buf.append(rendered)
+                render_wall += time.perf_counter() - render_start
             frame_idx += 1
-            if video_writer is None and len(frames_buf) >= args.chunk_size:
+            if (
+                media_enabled
+                and video_writer is None
+                and len(frames_buf) >= args.chunk_size
+            ):
                 flush_chunk()
 
             if sim.t >= t_impact and frame_idx % args.bound_check_every == 0:
@@ -2863,7 +3394,7 @@ def main(argv: list[str] | None = None) -> None:
                     break
 
             if rate is None and frame_idx >= 100:
-                elapsed = time.time() - t0_wall
+                elapsed = time.perf_counter() - t0_wall
                 rate = elapsed / frame_idx
                 remaining = rate * (expected_frames - frame_idx)
                 eta_wall = time.time() + remaining
@@ -2879,13 +3410,14 @@ def main(argv: list[str] | None = None) -> None:
                 )
                 log_debug(
                     f"         frame {frame_idx:5d}  t={format_hms(sim.t)}  "
-                    f"wall={format_hms(time.time() - t0_wall)}  eta={eta_text}",
+                    f"wall={format_hms(time.perf_counter() - t0_wall)}  eta={eta_text}",
                 )
 
     except BaseException:
         if video_writer is not None:
             video_writer.abort()
-        plt.close(fig)
+        if fig is not None:
+            plt.close(fig)
         raise
 
     if progress.n < progress.total:
@@ -2894,12 +3426,16 @@ def main(argv: list[str] | None = None) -> None:
     flush_chunk()
     if video_writer is not None:
         video_writer.close()
-    plt.close(fig)
+    if fig is not None:
+        plt.close(fig)
     total_frames = frame_idx
-    log_info(
-        f"\n         Collected {total_frames} frames"
-        + ("" if stream_video else f" over {len(chunk_paths)} chunk(s)")
-    )
+    if media_enabled:
+        log_info(
+            f"\n         Collected {total_frames} frames"
+            + ("" if stream_video else f" over {len(chunk_paths)} chunk(s)")
+        )
+    else:
+        log_info(f"\n         Integrated {total_frames} steps; no media written")
     body_diagnostics(sim, "t_max")
     final_bound = bound_debris_stats(
         sim,
@@ -2918,6 +3454,43 @@ def main(argv: list[str] | None = None) -> None:
         f"both={final_bound['f_bound_both']:.3f}",
     )
 
+    if args.case_scan_out is not None:
+        if realisation is None:
+            raise SystemExit("--case-scan-out requires a parameter-scan case")
+        secondary_radius = float(realisation["R_b"])
+        bullet_radius = float(realisation["R_c"])
+        stats = collision_product_stats(
+            sim,
+            n_host=n_particles[0],
+            n_secondary=n_particles[1],
+            n_bullet=n_particles[2],
+        )
+        b_r2 = float(realisation["b_contact"]) / secondary_radius
+        row = {
+            "impact_parameter_m": b_r2 * secondary_radius,
+            "impact_parameter_r2": b_r2,
+            "impact_target_r2": args.case_scan_target,
+            **{
+                key: value
+                for key, value in stats.items()
+                if not isinstance(value, np.ndarray)
+            },
+        }
+        atomic_write_json(
+            Path(args.case_scan_out),
+            {
+                "run_id": run_meta["run_id"],
+                "realisation_index": chosen_index,
+                "target_masses": list(target_masses),
+                "n_particles": list(n_particles),
+                "secondary_radius_m": secondary_radius,
+                "bullet_radius_m": bullet_radius,
+                "impact_row": row,
+            },
+        )
+        log_info(f"         Impact case row -> {args.case_scan_out}")
+
+    media_start = time.perf_counter()
     if save_gif:
         if total_frames > 2000:
             log_warning(
@@ -2939,19 +3512,24 @@ def main(argv: list[str] | None = None) -> None:
             crf=args.video_crf,
             show_progress=show_progress,
         )
+    media_wall += time.perf_counter() - media_start
 
     run_meta.update(
         {
             "frames": total_frames,
             "chunks": [str(path) for path in chunk_paths],
             "media_format": args.media_format,
+            "media_enabled": media_enabled,
             "gif": str(gif_path) if save_gif else None,
             "video": str(video_path) if save_video else None,
             "streamed_video": stream_video,
             "stopped_early": stopped_early,
             "bound_final": final_bound,
             "bound_history": bound_history,
-            "wall_time_s": time.time() - t0_wall,
+            "sim_wall_s": sim_wall,
+            "render_wall_s": render_wall,
+            "media_wall_s": media_wall,
+            "wall_time_s": time.perf_counter() - t0_wall,
         }
     )
     atomic_write_json(manifest_path, run_meta)
