@@ -25,11 +25,14 @@ CLI:
         --ma 1e15 --mb 1e13 --mc 1e12 \
         --particles-per-body 1000 \
         --resolve-primary
-    // run several simulation to trace relation between mass and impact parameter
+    // run several simulations to trace the mass/impact-parameter relation
+    // the default grid is 0.00..2.00 in steps of 0.05
     python main.py --impact-scan \
         --ma 1e15 --mb 1e13 --mc 1e12 \
-        --impact-parameters 0 0.25 0.5 0.75 1.0 1.25 1.5 2.0 \
         --impact-out media/impact_scan.png
+    // skip frames/video for a batch run; only write the result JSON
+    python main.py --param-path data/param_scan_test/ --param-index 42 \
+        --no-media --case-scan-target 0.5 --case-scan-out case.json
 """
 
 from __future__ import annotations
@@ -156,8 +159,8 @@ STEPS_PER_FRAME_HIT: int = int(_cfg("impact", "steps_per_frame", 5))
 # ==================================================================================== #
 
 SEPARATION_FACTOR: float = 6.0
-IMPACT_PRIMARY_SEPARATION_FACTOR: float = 2.0
 BULLET_SPEED: float = float(_cfg("impact", "bullet_speed", 100.0))  # m/s
+DEFAULT_IMPACT_PARAMETERS: list[float] = [0.05 * index for index in range(41)]
 BOX_SIZE_FACTOR: float = 32.0
 POST_IMPACT_TAIL: float = float(_cfg("impact", "post_impact_tail", 18000.0))  # s
 
@@ -1600,16 +1603,12 @@ def build_scene_fixed(
     softening: float,
     bullet_speed: float = BULLET_SPEED,
     impact_parameter: float = 0.0,
-    primary_separation_factor: float = 1.0,
 ) -> tuple[rebound.Simulation, float, float, float, int, float, float]:
     """
     Build the fixed-geometry scene
 
     `impact_parameter`
         Offsets the bullet perpendicular to its velocity.
-    `primary_separation_factor`
-        Moves the primary away from the collision
-        (the impact scan uses this to suppress the primary tide).
 
     Returns `sim, a_bin, t_bin, t_impact, n_host, separation, a_extent`
     """
@@ -1631,7 +1630,7 @@ def build_scene_fixed(
     add_settled_fixed(
         sim,
         state1,
-        OFFSET_1 * separation * primary_separation_factor,
+        OFFSET_1 * separation,
         BLKVEL_1 * bullet_speed,
         density=density,
     )
@@ -1991,28 +1990,39 @@ def plot_impact_scan(
     """Plot ring, debris, and secondary host mass against impact parameter"""
     out_path = Path(out_path)
     b = np.asarray([row["impact_parameter_r2"] for row in rows], float)
+    series = (
+        ("mass_ring_kg", "o-", "C0", "ring (bound to primary)"),
+        ("mass_debris_kg", "s-", "C1", "debris (unbound)"),
+        ("mass_secondary_kg", "^-", "C2", "secondary remnant"),
+    )
     fig, ax = plt.subplots(figsize=(FIG_SIZE_IN, 0.62 * FIG_SIZE_IN))
-    ax.plot(
-        b,
-        [row["mass_ring_kg"] for row in rows],
-        "o-",
-        color="C0",
-        label="ring (bound to primary)",
-    )
-    ax.plot(
-        b,
-        [row["mass_debris_kg"] for row in rows],
-        "s-",
-        color="C1",
-        label="debris (unbound)",
-    )
-    ax.plot(
-        b,
-        [row["mass_secondary_kg"] for row in rows],
-        "^-",
-        color="C2",
-        label="secondary remnant",
-    )
+    targets = [row.get("impact_target_r2") for row in rows]
+    if all(target is not None for target in targets):
+        target_values = np.asarray(targets, float)
+        for key, marker, color, label in series:
+            y = np.asarray([float(row[key]) for row in rows])
+            mean = np.asarray(
+                [y[target_values == value].mean() for value in np.unique(target_values)]
+            )
+            low = np.asarray(
+                [y[target_values == value].min() for value in np.unique(target_values)]
+            )
+            high = np.asarray(
+                [y[target_values == value].max() for value in np.unique(target_values)]
+            )
+            ax.errorbar(
+                np.unique(target_values),
+                mean,
+                yerr=np.vstack((mean - low, high - mean)),
+                fmt=marker,
+                color=color,
+                capsize=2,
+                label=label,
+            )
+        b = target_values
+    else:
+        for key, marker, color, label in series:
+            ax.plot(b, [row[key] for row in rows], marker, color=color, label=label)
     contact = 1.0 + bullet_radius / secondary_radius
     if b.min() <= contact <= b.max():
         ax.axvline(contact, color="0.35", ls="--", lw=0.9, label="contact")
@@ -2076,7 +2086,6 @@ def run_impact_scan(
             softening=args.softening,
             bullet_speed=args.bullet_speed,
             impact_parameter=b,
-            primary_separation_factor=IMPACT_PRIMARY_SEPARATION_FACTOR,
         )
         t_max = 2.0 * t_impact + float(args.post_impact_tail)
         if t_max <= 0:
@@ -2146,7 +2155,6 @@ def run_impact_scan(
         "secondary_radius_m": secondary_radius,
         "bullet_radius_m": bullet_radius,
         "contact_impact_parameter_r2": 1.0 + bullet_radius / secondary_radius,
-        "primary_separation_factor": IMPACT_PRIMARY_SEPARATION_FACTOR,
         "a_bin_m": a_bin,
         "bullet_speed_m_s": args.bullet_speed,
         "post_impact_tail_s": args.post_impact_tail,
@@ -2645,7 +2653,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--impact-parameters",
         nargs="+",
         type=float,
-        default=[0.0, 0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0],
+        default=DEFAULT_IMPACT_PARAMETERS,
         metavar="B/R2",
         help="impact parameters in units of the secondary host radius",
     )
@@ -2660,6 +2668,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=str,
         default=None,
         help="parameter-scan plot path",
+    )
+    parser.add_argument(
+        "--case-scan-target",
+        type=float,
+        default=None,
+        help="target impact parameter for a grouped case-scan selection",
     )
 
     parser.add_argument("--particles-per-body", type=int, default=None)
@@ -2731,6 +2745,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         choices=("gif", "mp4", "both"),
         default=MEDIA_FORMAT,
         help="write a GIF, an MP4, or both",
+    )
+    parser.add_argument(
+        "--no-media",
+        action="store_true",
+        help="skip frame rendering and video/gif encoding",
     )
     parser.add_argument(
         "--color-mode",
@@ -2850,6 +2869,11 @@ def main(argv: list[str] | None = None) -> None:
             raise SystemExit("--case-scan-out requires --param-path")
         if Path(args.case_scan_out).suffix.lower() != ".json":
             raise SystemExit("--case-scan-out must end in .json")
+    if args.case_scan_target is not None:
+        if args.case_scan_out is None:
+            raise SystemExit("--case-scan-target requires --case-scan-out")
+        if not np.isfinite(args.case_scan_target) or args.case_scan_target < 0.0:
+            raise SystemExit("--case-scan-target must be finite and non-negative")
 
     # resolve masses
     realisation: dict[str, Any] | None = None
@@ -3189,29 +3213,40 @@ def main(argv: list[str] | None = None) -> None:
     log_info("\nStage 3: run sim and cache frames")
     gif_path = GIF_DIR / f"{GIF_STEM}_{run_id}.gif"
     video_path = VID_DIR / f"{VID_STEM}_{run_id}.mp4"
-    save_gif = args.media_format in ("gif", "both")
-    save_video = args.media_format in ("mp4", "both")
+    media_enabled = not args.no_media
+    save_gif = media_enabled and args.media_format in ("gif", "both")
+    save_video = media_enabled and args.media_format in ("mp4", "both")
     grayscale = args.color_mode == "gray"
     stream_video = save_video and not save_gif and not args.keep_frames
-    if stream_video:
+    if args.no_media:
+        log_info("         media mode: disabled by --no-media")
+    elif stream_video:
         log_info(
             "         media mode: streaming MP4; no frame chunks are written",
         )
     chunks_dir: Path | None = None
-    if not stream_video:
+    if media_enabled and not stream_video:
         chunks_dir = DATA_DIR / f"collision_frames_{run_id}"
         chunks_dir.mkdir(parents=True, exist_ok=True)
 
-    fig, ax, canvas, circles = make_canvas(
-        sim,
-        fig_size_in=args.fig_size_in,
-        dpi=args.render_dpi,
-    )
+    fig: Any = None
+    ax: Any = None
+    canvas: Any = None
+    circles: list[Any] = []
+    if media_enabled:
+        fig, ax, canvas, circles = make_canvas(
+            sim,
+            fig_size_in=args.fig_size_in,
+            dpi=args.render_dpi,
+        )
     frames_buf: list[np.ndarray] = []
     chunk_paths: list[Path] = []
     chunk_idx = 0
     frame_idx = 0
-    t0_wall = time.time()
+    t0_wall = time.perf_counter()
+    sim_wall = 0.0
+    render_wall = 0.0
+    media_wall = 0.0
 
     def flush_chunk() -> None:
         nonlocal frames_buf, chunk_idx
@@ -3227,43 +3262,46 @@ def main(argv: list[str] | None = None) -> None:
         frames_buf = []
         chunk_idx += 1
 
-    # Frame 000 explicitly, with a blank-frame check.
-    frame0 = render_frame_rgb(
-        canvas,
-        ax,
-        circles,
-        sim,
-        sim.t,
-        0,
-        min_half=min_half_m,
-        max_half=max_half_m,
-        view_percentile=args.view_percentile,
-        grayscale=grayscale,
-    )
-    non_white = int((frame0.mean(axis=-1) < 200).sum())
-    frac = non_white / float(frame0.shape[0] * frame0.shape[1])
-    log_debug(
-        f"         frame 000: shape={frame0.shape} mean={frame0.mean():.1f} "
-        f"non_white={frac:.4f}",
-    )
-    if frac == 0.0:
-        log_warning("         frame 000 is blank")
     video_writer: FFmpegVideoWriter | None = None
-    if stream_video:
-        video_writer = FFmpegVideoWriter(
-            video_path,
-            int(frame0.shape[1]),
-            int(frame0.shape[0]),
-            fps=args.video_fps,
-            crf=args.video_crf,
+    if media_enabled:
+        # Frame 000 explicitly, with a blank-frame check.
+        render_start = time.perf_counter()
+        frame0 = render_frame_rgb(
+            canvas,
+            ax,
+            circles,
+            sim,
+            sim.t,
+            0,
+            min_half=min_half_m,
+            max_half=max_half_m,
+            view_percentile=args.view_percentile,
             grayscale=grayscale,
         )
-        video_writer.write(frame0)
-    else:
-        frames_buf.append(frame0)
-    frame_idx = 1
-    if not stream_video and len(frames_buf) >= args.chunk_size:
-        flush_chunk()
+        render_wall += time.perf_counter() - render_start
+        non_white = int((frame0.mean(axis=-1) < 200).sum())
+        frac = non_white / float(frame0.shape[0] * frame0.shape[1])
+        log_debug(
+            f"         frame 000: shape={frame0.shape} mean={frame0.mean():.1f} "
+            f"non_white={frac:.4f}",
+        )
+        if frac == 0.0:
+            log_warning("         frame 000 is blank")
+        if stream_video:
+            video_writer = FFmpegVideoWriter(
+                video_path,
+                int(frame0.shape[1]),
+                int(frame0.shape[0]),
+                fps=args.video_fps,
+                crf=args.video_crf,
+                grayscale=grayscale,
+            )
+            video_writer.write(frame0)
+        else:
+            frames_buf.append(frame0)
+        frame_idx = 1
+        if not stream_video and len(frames_buf) >= args.chunk_size:
+            flush_chunk()
 
     rate: float | None = None
     eta_wall: float | None = None
@@ -3284,38 +3322,49 @@ def main(argv: list[str] | None = None) -> None:
                 sim.t + args.steps_per_frame * args.dt_hit,
                 t_max,
             )
+            sim_start = time.perf_counter()
             sim.integrate(t_next)
+            sim_wall += time.perf_counter() - sim_start
             align_root_size(sim)
             delta = max(0.0, float(sim.t) - last_t)
             progress.update(min(delta, float(progress.total) - progress.n))
             last_t = float(sim.t)
 
-            if len(circles) != sim.N:
-                plt.close(fig)
-                fig, ax, canvas, circles = make_canvas(
-                    sim,
-                    fig_size_in=args.fig_size_in,
-                    dpi=args.render_dpi,
-                )
+            if media_enabled:
+                if len(circles) != sim.N:
+                    plt.close(fig)
+                    fig, ax, canvas, circles = make_canvas(
+                        sim,
+                        fig_size_in=args.fig_size_in,
+                        dpi=args.render_dpi,
+                    )
 
-            rendered = render_frame_rgb(
-                canvas,
-                ax,
-                circles,
-                sim,
-                sim.t,
-                frame_idx,
-                min_half=min_half_m,
-                max_half=max_half_m,
-                view_percentile=args.view_percentile,
-                grayscale=grayscale,
-            )
-            if video_writer is not None:
-                video_writer.write(rendered)
-            else:
-                frames_buf.append(rendered)
+                render_start = time.perf_counter()
+                rendered = render_frame_rgb(
+                    canvas,
+                    ax,
+                    circles,
+                    sim,
+                    sim.t,
+                    frame_idx,
+                    min_half=min_half_m,
+                    max_half=max_half_m,
+                    view_percentile=args.view_percentile,
+                    grayscale=grayscale,
+                )
+                if video_writer is not None:
+                    encode_start = time.perf_counter()
+                    video_writer.write(rendered)
+                    media_wall += time.perf_counter() - encode_start
+                else:
+                    frames_buf.append(rendered)
+                render_wall += time.perf_counter() - render_start
             frame_idx += 1
-            if video_writer is None and len(frames_buf) >= args.chunk_size:
+            if (
+                media_enabled
+                and video_writer is None
+                and len(frames_buf) >= args.chunk_size
+            ):
                 flush_chunk()
 
             if sim.t >= t_impact and frame_idx % args.bound_check_every == 0:
@@ -3345,7 +3394,7 @@ def main(argv: list[str] | None = None) -> None:
                     break
 
             if rate is None and frame_idx >= 100:
-                elapsed = time.time() - t0_wall
+                elapsed = time.perf_counter() - t0_wall
                 rate = elapsed / frame_idx
                 remaining = rate * (expected_frames - frame_idx)
                 eta_wall = time.time() + remaining
@@ -3361,13 +3410,14 @@ def main(argv: list[str] | None = None) -> None:
                 )
                 log_debug(
                     f"         frame {frame_idx:5d}  t={format_hms(sim.t)}  "
-                    f"wall={format_hms(time.time() - t0_wall)}  eta={eta_text}",
+                    f"wall={format_hms(time.perf_counter() - t0_wall)}  eta={eta_text}",
                 )
 
     except BaseException:
         if video_writer is not None:
             video_writer.abort()
-        plt.close(fig)
+        if fig is not None:
+            plt.close(fig)
         raise
 
     if progress.n < progress.total:
@@ -3376,12 +3426,16 @@ def main(argv: list[str] | None = None) -> None:
     flush_chunk()
     if video_writer is not None:
         video_writer.close()
-    plt.close(fig)
+    if fig is not None:
+        plt.close(fig)
     total_frames = frame_idx
-    log_info(
-        f"\n         Collected {total_frames} frames"
-        + ("" if stream_video else f" over {len(chunk_paths)} chunk(s)")
-    )
+    if media_enabled:
+        log_info(
+            f"\n         Collected {total_frames} frames"
+            + ("" if stream_video else f" over {len(chunk_paths)} chunk(s)")
+        )
+    else:
+        log_info(f"\n         Integrated {total_frames} steps; no media written")
     body_diagnostics(sim, "t_max")
     final_bound = bound_debris_stats(
         sim,
@@ -3403,8 +3457,8 @@ def main(argv: list[str] | None = None) -> None:
     if args.case_scan_out is not None:
         if realisation is None:
             raise SystemExit("--case-scan-out requires a parameter-scan case")
-        secondary_radius = body_radius(state2)
-        bullet_radius = body_radius(state3)
+        secondary_radius = float(realisation["R_b"])
+        bullet_radius = float(realisation["R_c"])
         stats = collision_product_stats(
             sim,
             n_host=n_particles[0],
@@ -3415,6 +3469,7 @@ def main(argv: list[str] | None = None) -> None:
         row = {
             "impact_parameter_m": b_r2 * secondary_radius,
             "impact_parameter_r2": b_r2,
+            "impact_target_r2": args.case_scan_target,
             **{
                 key: value
                 for key, value in stats.items()
@@ -3435,6 +3490,7 @@ def main(argv: list[str] | None = None) -> None:
         )
         log_info(f"         Impact case row -> {args.case_scan_out}")
 
+    media_start = time.perf_counter()
     if save_gif:
         if total_frames > 2000:
             log_warning(
@@ -3456,19 +3512,24 @@ def main(argv: list[str] | None = None) -> None:
             crf=args.video_crf,
             show_progress=show_progress,
         )
+    media_wall += time.perf_counter() - media_start
 
     run_meta.update(
         {
             "frames": total_frames,
             "chunks": [str(path) for path in chunk_paths],
             "media_format": args.media_format,
+            "media_enabled": media_enabled,
             "gif": str(gif_path) if save_gif else None,
             "video": str(video_path) if save_video else None,
             "streamed_video": stream_video,
             "stopped_early": stopped_early,
             "bound_final": final_bound,
             "bound_history": bound_history,
-            "wall_time_s": time.time() - t0_wall,
+            "sim_wall_s": sim_wall,
+            "render_wall_s": render_wall,
+            "media_wall_s": media_wall,
+            "wall_time_s": time.perf_counter() - t0_wall,
         }
     )
     atomic_write_json(manifest_path, run_meta)
