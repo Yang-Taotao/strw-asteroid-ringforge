@@ -1,5 +1,11 @@
 """
-Utils -> Select parameter-scan cases and merge their impact-scan rows
+Select parameter-scan cases and merge their impact-scan rows
+
+`select` groups cases by impact parameter: `count / repeats` targets
+    with `repeats` nearby realisations per target
+
+`merge` reads the per-case JSON rows
+    and draws the mean with min/max error bars at each target
 """
 
 from __future__ import annotations
@@ -11,37 +17,68 @@ from typing import Any
 
 import main as main_module
 import numpy as np
+import param_utils
 
 
-def select_cases(scan_dir: Path, count: int, seed: int, out: Path) -> None:
-    """Write `count` reproducible, successful scan idx to `out`"""
-    if count < 1:
-        raise SystemExit("--count must be positive")
+def select_cases(
+    scan_dir: Path,
+    count: int,
+    seed: int,
+    out: Path,
+    repeats: int,
+) -> None:
+    """
+    Write `count` reproducible cases grouped by impact parameter to `out`
 
-    paths = sorted(Path(scan_dir).glob("chunk_*.npz"))
-    if not paths:
-        raise SystemExit(f"no chunk_*.npz files under {scan_dir}")
+    The table has columns `target_r2`, `index`, and `b_r2`
+    Targets are evenly spaced across the successful scan range
+        `repeats` nearest unused cases are selected at each target
+    """
+    if count < 1 or repeats < 1 or count % repeats:
+        raise SystemExit("--count must be positive and divisible by --repeats")
 
-    indices: set[int] = set()
-    for path in paths:
-        with np.load(path, allow_pickle=False) as data:
-            success = np.asarray(data["success"], dtype=bool)
-            indices.update(int(value) for value in np.asarray(data["index"])[success])
-    available = sorted(indices)
-    if len(available) < count:
-        raise SystemExit(
-            f"only {len(available)} successful cases in {scan_dir}; need {count}"
-        )
+    data, _ = param_utils.load_chunks(scan_dir)
+    success = np.asarray(data["success"], dtype=bool)
+    index = np.asarray(data["index"], dtype=np.int64)
+    b = np.asarray(data["b_contact"], dtype=float) / np.asarray(
+        data["R_b"], dtype=float
+    )
+    keep = success & np.isfinite(b)
+    if not np.any(keep):
+        raise SystemExit(f"no successful cases in {scan_dir}")
 
+    available_b = b[keep]
+    available_idx = index[keep]
+    groups = count // repeats
+    targets = np.linspace(available_b.min(), available_b.max(), groups)
     rng = np.random.default_rng(seed)
-    chosen = np.sort(
-        rng.choice(np.asarray(available, dtype=np.int64), count, replace=False)
-    )
+
+    spacing = (available_b.max() - available_b.min()) / max(groups - 1, 1)
+    targets += rng.uniform(-0.1, 0.1, groups) * spacing
+    targets = np.clip(targets, available_b.min(), available_b.max())
+
+    chosen: list[tuple[float, int, float]] = []
+    unused = np.ones(available_b.size, dtype=bool)
+    for target in targets:
+        for _ in range(repeats):
+            candidates = np.flatnonzero(unused)
+            if candidates.size == 0:
+                raise SystemExit(f"only {available_b.size} successful cases available")
+            pick = candidates[np.argmin(np.abs(available_b[candidates] - target))]
+            unused[pick] = False
+            chosen.append(
+                (float(target), int(available_idx[pick]), float(available_b[pick]))
+            )
+
+    chosen.sort(key=lambda row: row[2])
     out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(
-        "\n".join(str(int(value)) for value in chosen) + "\n", encoding="utf-8"
+    lines = ["# target_r2\tindex\tb_r2"]
+    lines += [f"{target:.6f}\t{idx}\t{value:.6f}" for target, idx, value in chosen]
+    out.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    print(
+        f"Selected {len(chosen)} cases ({groups} targets x {repeats}) "
+        f"from {int(keep.sum())} successful rows -> {out}"
     )
-    print(f"Selected {count} of {len(available)} successful scan rows -> {out}")
 
 
 def merge_cases(case_dir: Path, count: int, out: Path, json_out: Path) -> None:
@@ -56,7 +93,12 @@ def merge_cases(case_dir: Path, count: int, out: Path, json_out: Path) -> None:
         json.loads(path.read_text(encoding="utf-8")) for path in paths
     ]
     rows = [payload["impact_row"] for payload in payloads]
-    rows.sort(key=lambda row: float(row["impact_parameter_r2"]))
+    rows.sort(
+        key=lambda row: (
+            float(row.get("impact_target_r2") or -1.0),
+            float(row["impact_parameter_r2"]),
+        )
+    )
 
     secondary_radius = float(payloads[0]["secondary_radius_m"])
     bullet_radius = float(payloads[0]["bullet_radius_m"])
@@ -95,6 +137,7 @@ def build_parser() -> argparse.ArgumentParser:
     pick = sub.add_parser("select", help="pick reproducible successful scan indices")
     pick.add_argument("--scan-dir", type=Path, default=Path("data/param_scan_test"))
     pick.add_argument("--count", type=int, default=24)
+    pick.add_argument("--repeats", type=int, default=3)
     pick.add_argument("--seed", type=int, default=42)
     pick.add_argument("--out", type=Path, required=True)
 
@@ -113,7 +156,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     args = build_parser().parse_args()
     if args.command == "select":
-        select_cases(args.scan_dir, args.count, args.seed, args.out)
+        select_cases(args.scan_dir, args.count, args.seed, args.out, args.repeats)
     else:
         merge_cases(args.case_dir, args.count, args.out, args.json_out)
 
