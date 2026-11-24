@@ -83,7 +83,9 @@ def setup_logging(
     file_handler = logging.FileHandler(path, mode="a", encoding="utf-8")
     file_handler.setLevel(file_level)
     file_handler.setFormatter(
-        logging.Formatter("%(asctime)s %(levelname)-8s %(name)s:%(lineno)d %(message)s")
+        logging.Formatter(
+            "%(asctime)s %(levelname)-8s [%(process)d] %(name)s:%(lineno)d %(message)s"
+        )
     )
     logger.addHandler(file_handler)
 
