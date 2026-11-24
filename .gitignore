@@ -224,3 +224,4 @@ dev/
 # misc
 *notes.md
 logs/
+.mplconfig/
