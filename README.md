@@ -88,7 +88,43 @@ conda activate amuse-py313
 python main.py
 
 # Use a realisation from a parameter scan
-python main.py --param-path data/param_scan_test --param-index 42
+python main.py --param-path data/param_scan_1m --param-index 100 --density 500
+
+# Quick impact-parameter scan (default signed grid: -2.00 to +2.00, step 0.25)
+python main.py --impact-scan --impact-out media/impact_scan.png
+
+# Smaller three-point impact-parameter scan
+python main.py --impact-scan --impact-parameters -1 0 1 \
+    --impact-out media/impact_scan_test.png
+
+# Direct-b parameter scan: store the impact parameter in every row
+python param_utils.py scan --n 27 \
+    --impact-parameters -2 -1.5 -1 -0.5 0 0.5 1 1.5 2 \
+    --out data/param_scan_b27
+
+# Add the eccentricity vs |a| semi-major axis diagnostic to one run
+python main.py --param-path data/param_scan_1m --param-index 100 --density 500 \
+    --orbit-plot media/orbit_eccentricity.png
+
+# Add a bound-eccentricity vs impact-parameter curve to a scan
+python main.py --impact-scan --impact-parameters 0 0.5 1 1.5 2 \
+    --impact-out media/impact_scan.png \
+    --eccentricity-scan-out media/eccentricity_vs_b.png
+
+# Smear bound ring orbits into a radial surface-density profile
+python main.py --ma 1e15 --mb 1e13 --mc 1e12 --density 500 \
+    --n2 1000 --n3 1000 --impact-parameter 0.5 \
+    --post-impact-tail 10000 --dt-hit 1 \
+    --no-media --surface-density media/surface_density.png
+
+# Skip video/GIF rendering for a batch case
+python main.py --param-path data/param_scan_1m --param-index 100 --density 500 --no-media
+
+# Batch: 9 cases, one per impact parameter, 6 workers, no media
+./run_cases.sh 42
+
+# Fast local batch smoke test
+./local_case_test.sh 42
 
 # Force re-settlement of every asteroid
 python main.py --overwrite-settled
@@ -145,12 +181,15 @@ Command-line flags override them for one run.
 | `[run]`     | `seed`, `placement_seed`, data/media/log directories     | `42`, `42`, `data`, `media`, `logs`       |
 | `[bodies]`  | masses, density, size slope, radius range, counts        | `1e15`, `1e13`, `1e12` kg; `3000` kg/m3   |
 | `[settle]`  | settle time, dt, softening, integrator, stability gate   | `108000` s, `10` s, `20` m, `leapfrog`    |
-| `[impact]`  | bullet speed, post-impact tail, dt, steps per frame      | `100` m/s, `18000` s, `1` s, `5`          |
+| `[impact]`  | bullet speed, post-impact tail, dt, steps per frame      | `100` m/s, `10000` s, `1` s, `5`          |
 | `[render]`  | media format, colour mode, fps, CRF, DPI                 | `mp4`, `gray`, `20`, `20`, `100`          |
 | `[scan]`    | geometry, realisations, workers, chunk size, lookbacks   | `uniform`, `10000`, `16`, `2000`          |
 
-`n1`, `n2`, and `n3` set the target particle counts for host 1, host 2, and the
-bullet. `--particles-per-body` overrides all three with the same count.
+`n1`, `n2`, and `n3` set the target particle counts for host 1, host 2, and the bullet.
+They default to `1000`.
+Use `--particles-per-body` to override all three with the same count.
+The post-impact tail defaults to `10000` s.
+GIF renders use `18000` s. `--no-media` skips frame/video work.
 
 > [!IMPORTANT]
 > Every parameter that influences the settled state is hashed into the
@@ -164,6 +203,7 @@ bullet. `--particles-per-body` overrides all three with the same count.
 ```sh
 .
 ├── config.py                    # config loader
+├── case_scan.py                 # grouped case selection + merge
 ├── config.toml                  # global defaults
 ├── data                         # simulation data
 │   ├── collision_frames_xxx     # optional frame chunks
@@ -173,6 +213,7 @@ bullet. `--particles-per-body` overrides all three with the same count.
 ├── env.yml                      # conda env
 ├── LICENSE
 ├── logs                         # run logs
+├── local_case_test.sh           # local smoke test
 ├── lumberyard.py                # logger utils
 ├── main.py                      # simulation pipeline
 ├── media                        # rendered media
@@ -184,6 +225,7 @@ bullet. `--particles-per-body` overrides all three with the same count.
 ├── pyproject.toml
 ├── README.md
 ├── run_cases.sh                 # batch case runner
+├── apophis.py                   # Earth-Moon-Apophis example
 └── src
     └── ringforge                # module placeholder
 ```
@@ -336,6 +378,10 @@ python param_utils.py plot data/param_scan_test \
 ```sh
 python param_utils.py read data/param_scan_test --index 42
 ```
+
+The per-case and impact-scan rows record `ring_r_min_m` and `ring_r_max_m`:
+the minimum and maximum radial distance of bound ring particles from the
+primary at the final snapshot. These are also saved in the impact-scan `.npz`.
 
 The scan supports two direction samplings:
 
