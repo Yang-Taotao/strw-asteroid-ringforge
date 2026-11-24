@@ -115,6 +115,7 @@ SAMPLED_SCHEMA: list[tuple[str, tuple[int, ...]]] = [
     ("inc_bin", ()),  # rad
     ("v_rel", ()),  # m/s at contact
     ("binary_phase", ()),  # rad
+    ("impact_parameter_r2", ()),  # signed b/R_b; NaN in legacy scans
     ("offset_dir", (3,)),  # unit vector, mb -> mc at contact
     ("v_dir", (3,)),  # unit vector, v_mc - v_mb at contact
 ]
@@ -216,6 +217,23 @@ class Uniform(Param):
         return f"Uniform({fmt_num(self.lo)}, {fmt_num(self.hi)})"
 
 
+class ImpactParameter(Param):
+    """Cycle through an explicit signed impact-parameter grid"""
+
+    def __init__(self, values: tuple[float, ...]) -> None:
+        if not values:
+            raise ValueError("ImpactParameter requires at least one value")
+        if not all(np.isfinite(value) for value in values):
+            raise ValueError("impact parameters must be finite")
+        self.values = tuple(float(value) for value in values)
+
+    def sample(self, rng: np.random.Generator, index: int) -> float:
+        return float(self.values[int(index) % len(self.values)])
+
+    def describe(self) -> str:
+        return f"ImpactParameter(cycle {list(self.values)})"
+
+
 class ImpactGeometry(Param):
     """
     Sample bullet contact and approach directions at `t = 0`
@@ -272,6 +290,7 @@ class ScanConfig:
     geometry: str = str(_cfg("scan", "geometry", "uniform"))
     phase: str = str(_cfg("scan", "phase", "random"))
     lookback_periods: tuple[float, ...] = LOOKBACK_DEFAULT
+    impact_parameters: tuple[float, ...] = ()
     master_seed: int = int(_cfg("run", "seed", 42))
 
 
@@ -284,7 +303,7 @@ def make_params(config: ScanConfig) -> dict[str, Param]:
     else:
         raise ValueError(f"unknown phase mode: {config.phase!r}")
 
-    return {
+    params: dict[str, Param] = {
         "ma": Fixed(config.ma),
         "mb": Fixed(config.mb),
         "mc": Fixed(config.mc),
@@ -294,8 +313,11 @@ def make_params(config: ScanConfig) -> dict[str, Param]:
         "inc_bin": Fixed(config.inc_bin),
         "v_rel": Fixed(config.v_rel),
         "binary_phase": phase_sampler,
-        "geometry": ImpactGeometry(config.geometry),
     }
+    if config.impact_parameters:
+        params["impact_parameter_r2"] = ImpactParameter(config.impact_parameters)
+    params["geometry"] = ImpactGeometry(config.geometry)
+    return params
 
 
 def describe_space(params: dict[str, Param], master_seed: int) -> None:
@@ -397,17 +419,53 @@ def run_one(
     # Internal binary period (SI).
     t_bin = float(2.0 * np.pi * np.sqrt(a_bin**3 / (sim.G * (ma + mb))))
 
-    # Bullet at contact with mb at t = 0.
+    # Place the bullet.  The legacy path draws `off` and `v_dir` and derives
+    # b.  The impact-parameter path sets signed b directly.
     pb = sim.particles[1]
-    sim.add(
-        m=mc,
-        x=pb.x + contact * off[0],
-        y=pb.y + contact * off[1],
-        z=pb.z + contact * off[2],
-        vx=pb.vx + v_rel * v_dir[0],
-        vy=pb.vy + v_rel * v_dir[1],
-        vz=pb.vz + v_rel * v_dir[2],
-    )
+    b_target = real.get("impact_parameter_r2")
+    b_target_f = float(cast(float, b_target)) if b_target is not None else None
+    if b_target_f is not None and np.isfinite(b_target_f):
+        b_m = b_target_f * r_b
+        v_dir = v_dir / (np.linalg.norm(v_dir) + 1e-30)
+        ref = np.asarray([0.0, 0.0, 1.0])
+        if abs(float(np.dot(v_dir, ref))) > 0.9:
+            ref = np.asarray([0.0, 1.0, 0.0])
+        perp = np.cross(v_dir, ref)
+        perp /= np.linalg.norm(perp) + 1e-30
+        q = abs(b_m) / contact
+        if q <= 1.0:
+            mu = float(np.sqrt(max(0.0, 1.0 - q * q)))
+            off_unit = -mu * v_dir + (b_m / contact) * perp
+            offset_m = contact * off_unit
+        else:
+            # Beyond contact: start one contact radius before the secondary,
+            # with the requested perpendicular offset.  This is a flyby.
+            offset_m = -contact * v_dir + b_m * perp
+            off_unit = offset_m / (np.linalg.norm(offset_m) + 1e-30)
+            mu = float(-np.dot(off_unit, v_dir))
+        sim.add(
+            m=mc,
+            x=pb.x + offset_m[0],
+            y=pb.y + offset_m[1],
+            z=pb.z + offset_m[2],
+            vx=pb.vx + v_rel * v_dir[0],
+            vy=pb.vy + v_rel * v_dir[1],
+            vz=pb.vz + v_rel * v_dir[2],
+        )
+        b_contact = float(b_m)
+    else:
+        off_unit = off
+        sim.add(
+            m=mc,
+            x=pb.x + contact * off_unit[0],
+            y=pb.y + contact * off_unit[1],
+            z=pb.z + contact * off_unit[2],
+            vx=pb.vx + v_rel * v_dir[0],
+            vy=pb.vy + v_rel * v_dir[1],
+            vz=pb.vz + v_rel * v_dir[2],
+        )
+        mu = float(-np.dot(off_unit, v_dir))
+        b_contact = float(contact * np.sqrt(max(0.0, 1.0 - mu * mu)))
 
     state_0 = _extract(sim)
 
@@ -417,13 +475,11 @@ def run_one(
     # cos_contact =
     #   +1 means mc sits on the side mb is moving towards the leading edge
     #   -1 is the trailing edge
-    cos_contact = float(np.dot(off, v_mb_hat))
+    cos_contact = float(np.dot(off_unit, v_mb_hat))
     # cos_vrel =
     #   +1 means the bullet moves with mb (rear-end)
     #   -1 is head-on.
     cos_vrel = float(np.dot(v_dir, v_mb_hat))
-    mu = float(-np.dot(off, v_dir))
-    b_contact = float(contact * np.sqrt(max(0.0, 1.0 - mu * mu)))
 
     # Backward integration
     # IAS15 is time-reversible and its adaptive step handles the close contact
@@ -458,6 +514,7 @@ def run_one(
         "cos_vrel": cos_vrel,
         "mu": mu,
         "b_contact": b_contact,
+        "impact_parameter_r2": (b_target_f if b_target_f is not None else float("nan")),
     }
 
 
@@ -1178,6 +1235,12 @@ def _build_scan_parser(
         default=str(_cfg("run", "log_dir", "logs")),
     )
     parser.add_argument(
+        "--log-file",
+        type=str,
+        default=None,
+        help="explicit log path (default: unique file under --log-dir)",
+    )
+    parser.add_argument(
         "--geometry",
         choices=("uniform", "flux"),
         default=str(_cfg("scan", "geometry", "uniform")),
@@ -1195,6 +1258,13 @@ def _build_scan_parser(
     parser.add_argument("--e-bin", type=float, default=E_BIN_DEFAULT)
     parser.add_argument("--inc-bin", type=float, default=INC_BIN_DEFAULT)
     parser.add_argument("--v-rel", type=float, default=V_REL_DEFAULT)
+    parser.add_argument(
+        "--impact-parameters",
+        type=float,
+        nargs="+",
+        default=None,
+        help="signed b/R_b grid (e.g. -2 -1.5 ... 2); cycles over realisations",
+    )
     parser.add_argument(
         "--lookback",
         type=float,
@@ -1227,6 +1297,12 @@ def _build_plot_parser(
         type=str,
         default=str(_cfg("run", "log_dir", "logs")),
     )
+    parser.add_argument(
+        "--log-file",
+        type=str,
+        default=None,
+        help="explicit log path (default: unique file under --log-dir)",
+    )
 
 
 def _build_read_parser(
@@ -1247,6 +1323,12 @@ def _build_read_parser(
         "--log-dir",
         type=str,
         default=str(_cfg("run", "log_dir", "logs")),
+    )
+    parser.add_argument(
+        "--log-file",
+        type=str,
+        default=None,
+        help="explicit log path (default: unique file under --log-dir)",
     )
 
 
@@ -1297,6 +1379,7 @@ def main(argv: list[str] | None = None) -> None:
     _, log_path = setup_logging(
         "ringforge.param_utils",
         log_dir=args.log_dir,
+        log_file=args.log_file,
         console_level=logging.WARNING if args.quiet else logging.INFO,
     )
     show_progress = not args.quiet
@@ -1332,6 +1415,7 @@ def main(argv: list[str] | None = None) -> None:
             geometry=str(args.geometry),
             phase=str(args.phase),
             lookback_periods=tuple(float(x) for x in args.lookback),
+            impact_parameters=tuple(float(x) for x in (args.impact_parameters or [])),
             master_seed=int(args.seed),
         )
         run_batch(
