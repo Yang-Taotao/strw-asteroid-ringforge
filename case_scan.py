@@ -5,7 +5,7 @@ Select parameter-scan cases and merge their impact-scan rows
     with `repeats` nearby realisations per target
 
 `merge` reads the per-case JSON rows
-    and draws the mean with min/max error bars at each target
+    and draws the median with a 16-84% band at each target
 """
 
 from __future__ import annotations
@@ -26,6 +26,7 @@ def select_cases(
     seed: int,
     out: Path,
     repeats: int,
+    targets: list[float] | None = None,
 ) -> None:
     """
     Write `count` reproducible cases grouped by impact parameter to `out`
@@ -40,9 +41,12 @@ def select_cases(
     data, _ = param_utils.load_chunks(scan_dir)
     success = np.asarray(data["success"], dtype=bool)
     index = np.asarray(data["index"], dtype=np.int64)
-    b = np.asarray(data["b_contact"], dtype=float) / np.asarray(
-        data["R_b"], dtype=float
-    )
+    if "impact_parameter_r2" in data:
+        b = np.asarray(data["impact_parameter_r2"], dtype=float)
+    else:
+        b = np.asarray(data["b_contact"], dtype=float) / np.asarray(
+            data["R_b"], dtype=float
+        )
     keep = success & np.isfinite(b)
     if not np.any(keep):
         raise SystemExit(f"no successful cases in {scan_dir}")
@@ -50,16 +54,23 @@ def select_cases(
     available_b = b[keep]
     available_idx = index[keep]
     groups = count // repeats
-    targets = np.linspace(available_b.min(), available_b.max(), groups)
-    rng = np.random.default_rng(seed)
-
-    spacing = (available_b.max() - available_b.min()) / max(groups - 1, 1)
-    targets += rng.uniform(-0.1, 0.1, groups) * spacing
-    targets = np.clip(targets, available_b.min(), available_b.max())
+    if targets is None:
+        target_values = np.linspace(available_b.min(), available_b.max(), groups)
+        rng = np.random.default_rng(seed)
+        spacing = (available_b.max() - available_b.min()) / max(groups - 1, 1)
+        target_values += rng.uniform(-0.1, 0.1, groups) * spacing
+        target_values = np.clip(target_values, available_b.min(), available_b.max())
+    else:
+        target_values = np.asarray(targets, dtype=float)
+        if target_values.size != groups:
+            raise SystemExit(
+                f"--impact-parameters has {target_values.size} values, "
+                f"expected {groups} = count/repeats"
+            )
 
     chosen: list[tuple[float, int, float]] = []
     unused = np.ones(available_b.size, dtype=bool)
-    for target in targets:
+    for target in target_values:
         for _ in range(repeats):
             candidates = np.flatnonzero(unused)
             if candidates.size == 0:
@@ -135,15 +146,22 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     pick = sub.add_parser("select", help="pick reproducible successful scan indices")
-    pick.add_argument("--scan-dir", type=Path, default=Path("data/param_scan_test"))
-    pick.add_argument("--count", type=int, default=24)
-    pick.add_argument("--repeats", type=int, default=3)
+    pick.add_argument("--scan-dir", type=Path, default=Path("data/param_scan_1m"))
+    pick.add_argument("--count", type=int, default=9)
+    pick.add_argument("--repeats", type=int, default=1)
     pick.add_argument("--seed", type=int, default=42)
+    pick.add_argument(
+        "--impact-parameters",
+        type=float,
+        nargs="+",
+        default=None,
+        help="explicit signed target b/R_b values; count must be len*repeats",
+    )
     pick.add_argument("--out", type=Path, required=True)
 
     merge = sub.add_parser("merge", help="plot and save finished case rows")
     merge.add_argument("--case-dir", type=Path, required=True)
-    merge.add_argument("--count", type=int, default=24)
+    merge.add_argument("--count", type=int, default=9)
     merge.add_argument("--out", type=Path, default=Path("media/impact_scan.png"))
     merge.add_argument(
         "--json-out",
@@ -156,7 +174,14 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     args = build_parser().parse_args()
     if args.command == "select":
-        select_cases(args.scan_dir, args.count, args.seed, args.out, args.repeats)
+        select_cases(
+            args.scan_dir,
+            args.count,
+            args.seed,
+            args.out,
+            args.repeats,
+            args.impact_parameters,
+        )
     else:
         merge_cases(args.case_dir, args.count, args.out, args.json_out)
 

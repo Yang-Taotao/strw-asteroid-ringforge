@@ -26,7 +26,7 @@ CLI:
         --particles-per-body 1000 \
         --resolve-primary
     // run several simulations to trace the mass/impact-parameter relation
-    // the default grid is 0.00..2.00 in steps of 0.05
+    // the default grid is -2.00..2.00 in steps of 0.05
     python main.py --impact-scan \
         --ma 1e15 --mb 1e13 --mc 1e12 \
         --impact-out media/impact_scan.png
@@ -160,9 +160,15 @@ STEPS_PER_FRAME_HIT: int = int(_cfg("impact", "steps_per_frame", 5))
 
 SEPARATION_FACTOR: float = 6.0
 BULLET_SPEED: float = float(_cfg("impact", "bullet_speed", 100.0))  # m/s
-DEFAULT_IMPACT_PARAMETERS: list[float] = [0.05 * index for index in range(41)]
+DEFAULT_IMPACT_PARAMETERS: list[float] = [
+    float(value) for value in np.arange(-2.00, 2.25, 0.25)
+]
 BOX_SIZE_FACTOR: float = 32.0
-POST_IMPACT_TAIL: float = float(_cfg("impact", "post_impact_tail", 18000.0))  # s
+POST_IMPACT_TAIL: float = float(_cfg("impact", "post_impact_tail", 5000.0))  # s
+GIF_POST_IMPACT_TAIL: float = 18000.0  # s, long tail for visualisation
+SURFACE_DENSITY_BINS: int = 200
+SURFACE_DENSITY_SAMPLES: int = 256
+SURFACE_DENSITY_DIFFUSION: float = 0.05  # Gaussian sigma in R_secondary
 
 # Pseudo bin and bullet placement cfg
 OFFSET_1 = np.asarray([+0.00, 0.25, 0.00])
@@ -1937,14 +1943,15 @@ def collision_product_stats(
 
     rel_r = positions[ejecta_idx] - primary_pos
     rel_v = velocities[ejecta_idx] - primary_vel
-    r = np.linalg.norm(rel_r, axis=1)
-    energy = 0.5 * (rel_v**2).sum(axis=1) - G * primary_mass / np.maximum(r, 1e-9)
-    ring_mask = energy < 0.0
+    a, e, inc, valid = _orbital_elements(rel_r, rel_v, mu=G * primary_mass)
+    bound = np.isfinite(e) & (e <= 1.0)
+    ring_mask = bound
     ring_idx = ejecta_idx[ring_mask]
     debris_idx = ejecta_idx[~ring_mask]
 
-    a, e, inc, valid = _orbital_elements(rel_r, rel_v, mu=G * primary_mass)
-    bound = valid & (a > 0.0) & (e < 1.0)
+    ring_r = np.linalg.norm(rel_r[ring_mask], axis=1)
+    ring_r_min = float(ring_r.min()) if ring_r.size else float("nan")
+    ring_r_max = float(ring_r.max()) if ring_r.size else float("nan")
 
     mass_ring = float(masses[ring_idx].sum())
     mass_debris = float(masses[debris_idx].sum())
@@ -1957,6 +1964,7 @@ def collision_product_stats(
     median_e = float(np.median(e[bound])) if bound.any() else float("nan")
     median_inc = float(np.median(inc[bound])) if bound.any() else float("nan")
     return {
+        "contact": True,
         "mass_ring_kg": mass_ring,
         "mass_debris_kg": mass_debris,
         "mass_secondary_kg": mass_secondary,
@@ -1969,6 +1977,11 @@ def collision_product_stats(
         "n_ejecta": int(ejecta_idx.size),
         "n_valid_orbit": int(valid.sum()),
         "n_bound_orbit": int(bound.sum()),
+        "ring_r_min_m": ring_r_min,
+        "ring_r_max_m": ring_r_max,
+        "ring_indices": ring_idx,
+        "ring_masses_kg": masses[ring_idx],
+        "ring_r_m": ring_r,
         "median_a_m": median_a,
         "median_e": median_e,
         "median_inc_deg": median_inc,
@@ -1977,6 +1990,51 @@ def collision_product_stats(
         "orbital_inc_deg": inc,
         "orbital_valid": valid,
         "orbital_bound": bound,
+    }
+
+
+def no_contact_product_stats(
+    state2: np.ndarray,
+    state3: np.ndarray,
+    *,
+    density: float,
+) -> dict[str, Any]:
+    """Return the analytic no-contact row: no stripping, no debris."""
+    secondary_mass = float(
+        np.asarray(mass_from_radius(state2[:, 6], density), float).sum()
+    )
+    bullet_mass = float(
+        np.asarray(mass_from_radius(state3[:, 6], density), float).sum()
+    )
+    empty: np.ndarray = np.asarray([], dtype=float)
+    empty_bool: np.ndarray = np.asarray([], dtype=bool)
+    return {
+        "contact": False,
+        "mass_ring_kg": 0.0,
+        "mass_debris_kg": 0.0,
+        "mass_secondary_kg": secondary_mass,
+        "mass_secondary_total_kg": secondary_mass,
+        "mass_bullet_kg": bullet_mass,
+        "n_ring": 0,
+        "n_debris": 0,
+        "n_secondary": int(state2.shape[0]),
+        "n_bullet": int(state3.shape[0]),
+        "n_ejecta": 0,
+        "n_valid_orbit": 0,
+        "n_bound_orbit": 0,
+        "ring_r_min_m": float("nan"),
+        "ring_r_max_m": float("nan"),
+        "median_a_m": float("nan"),
+        "median_e": float("nan"),
+        "median_inc_deg": float("nan"),
+        "ring_indices": np.asarray([], dtype=int),
+        "ring_masses_kg": empty,
+        "ring_r_m": empty,
+        "orbital_a_m": empty,
+        "orbital_e": empty,
+        "orbital_inc_deg": empty,
+        "orbital_valid": empty_bool,
+        "orbital_bound": empty_bool,
     }
 
 
@@ -1994,44 +2052,111 @@ def plot_impact_scan(
         ("mass_ring_kg", "o-", "C0", "ring (bound to primary)"),
         ("mass_debris_kg", "s-", "C1", "debris (unbound)"),
         ("mass_secondary_kg", "^-", "C2", "secondary remnant"),
+        ("mass_total_kg", "--", "C3", "total tracked mass"),
     )
-    fig, ax = plt.subplots(figsize=(FIG_SIZE_IN, 0.62 * FIG_SIZE_IN))
+
+    def normalised(row: dict[str, Any], key: str) -> float:
+        total = float(row["mass_secondary_total_kg"]) + float(row["mass_bullet_kg"])
+        if total <= 0.0:
+            raise ValueError("secondary + bullet mass must be positive")
+        if key == "mass_total_kg":
+            return (
+                sum(
+                    float(row[name])
+                    for name in (
+                        "mass_ring_kg",
+                        "mass_debris_kg",
+                        "mass_secondary_kg",
+                        "mass_bullet_kg",
+                    )
+                )
+                / total
+            )
+        return float(row[key]) / total
+
+    fig, ax = plt.subplots(figsize=(1.2 * FIG_SIZE_IN, 0.65 * FIG_SIZE_IN))
     targets = [row.get("impact_target_r2") for row in rows]
     if all(target is not None for target in targets):
         target_values = np.asarray(targets, float)
-        for key, marker, color, label in series:
-            y = np.asarray([float(row[key]) for row in rows])
-            mean = np.asarray(
-                [y[target_values == value].mean() for value in np.unique(target_values)]
-            )
-            low = np.asarray(
-                [y[target_values == value].min() for value in np.unique(target_values)]
-            )
-            high = np.asarray(
-                [y[target_values == value].max() for value in np.unique(target_values)]
-            )
-            ax.errorbar(
-                np.unique(target_values),
-                mean,
-                yerr=np.vstack((mean - low, high - mean)),
-                fmt=marker,
+        unique_targets = np.unique(target_values)
+        for key, _marker, color, label in series:
+            y = np.asarray([normalised(row, key) for row in rows])
+            centre = np.empty(unique_targets.size)
+            low = np.empty(unique_targets.size)
+            high = np.empty(unique_targets.size)
+            for i, value in enumerate(unique_targets):
+                sample = y[target_values == value]
+                low[i], centre[i], high[i] = np.nanpercentile(
+                    sample, [16.0, 50.0, 84.0]
+                )
+            ax.fill_between(
+                unique_targets,
+                low,
+                high,
                 color=color,
-                capsize=2,
-                label=label,
+                alpha=0.16,
+                linewidth=0,
+                zorder=1,
             )
-        b = target_values
+            ax.plot(
+                unique_targets,
+                low,
+                color=color,
+                lw=0.5,
+                alpha=0.55,
+                zorder=1.5,
+            )
+            ax.plot(
+                unique_targets,
+                high,
+                color=color,
+                lw=0.5,
+                alpha=0.55,
+                zorder=1.5,
+            )
+            ax.plot(
+                unique_targets,
+                centre,
+                color=color,
+                lw=1.5,
+                label=label,
+                zorder=2,
+            )
+        b = unique_targets
     else:
-        for key, marker, color, label in series:
-            ax.plot(b, [row[key] for row in rows], marker, color=color, label=label)
+        for key, _marker, color, label in series:
+            ax.plot(
+                b,
+                [normalised(row, key) for row in rows],
+                color=color,
+                lw=1.6,
+                label=label,
+                zorder=2,
+            )
     contact = 1.0 + bullet_radius / secondary_radius
-    if b.min() <= contact <= b.max():
-        ax.axvline(contact, color="0.35", ls="--", lw=0.9, label="contact")
+    contact_drawn = False
+    for value in (-contact, contact):
+        if b.min() <= value <= b.max():
+            ax.axvline(
+                value,
+                color="0.35",
+                ls="--",
+                lw=0.9,
+                label=None if contact_drawn else "contact",
+            )
+            contact_drawn = True
     ax.set_xlabel(r"impact parameter $b/R_\mathrm{secondary}$")
-    ax.set_xlim(left=0.0)
-    ax.set_ylabel("mass [kg]")
-    ax.set_title("Secondary-host material after impact")
+    ax.set_ylabel(r"mass / $(M_\mathrm{secondary}+M_\mathrm{bullet})$")
+    ax.set_title("Post impact mass analysis")
+    ax.set_xlim(float(b.min()), float(b.max()))
     ax.grid(alpha=0.25)
-    ax.legend(fontsize=8)
+    ax.legend(
+        loc="upper center",
+        bbox_to_anchor=(0.5, -0.12),
+        ncol=5,
+        fontsize=8,
+        frameon=False,
+    )
     ax.text(
         0.02,
         0.98,
@@ -2040,10 +2165,336 @@ def plot_impact_scan(
         va="top",
         fontsize=8,
     )
+    if all(target is not None for target in targets):
+        ax.text(
+            0.99,
+            0.02,
+            "line: median\nshaded: 16-84% of realisations\nthin: interval edges",
+            transform=ax.transAxes,
+            ha="right",
+            va="bottom",
+            fontsize=7,
+            color="0.35",
+        )
     fig.tight_layout()
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path, dpi=300, bbox_inches="tight")
     plt.close(fig)
+
+
+def plot_orbit_diagnostic(
+    sim: rebound.Simulation,
+    out_path: str | Path,
+    *,
+    n_host: int,
+    n_secondary: int,
+    n_bullet: int,
+    secondary_radius: float,
+) -> None:
+    """Plot semi-major axis against eccentricity for all non-primary particles."""
+    if n_host + n_secondary + n_bullet != sim.N:
+        raise ValueError("particle counts do not match simulation size")
+    if secondary_radius <= 0.0:
+        raise ValueError("secondary radius must be positive")
+
+    masses = np.asarray([particle.m for particle in sim.particles], dtype=float)
+    positions = np.asarray(
+        [[particle.x, particle.y, particle.z] for particle in sim.particles],
+        dtype=float,
+    )
+    velocities = np.asarray(
+        [[particle.vx, particle.vy, particle.vz] for particle in sim.particles],
+        dtype=float,
+    )
+    primary_pos, primary_vel, primary_mass = _com_state(
+        masses[:n_host],
+        positions[:n_host],
+        velocities[:n_host],
+    )
+    indices = np.arange(n_host, sim.N)
+    rel_r = positions[indices] - primary_pos
+    rel_v = velocities[indices] - primary_vel
+    a, e, _inc, valid = _orbital_elements(rel_r, rel_v, mu=G * primary_mass)
+    finite = np.isfinite(a) & np.isfinite(e)
+    if not finite.any():
+        raise ValueError("no finite particle orbits to plot")
+
+    a = np.abs(a[finite]) / secondary_radius
+    e = e[finite]
+    positive = a > 0.0
+    a = a[positive]
+    e = e[positive]
+    if a.size == 0:
+        raise ValueError("no positive |a| values to plot")
+    bound = e <= 1.0
+    fig, ax = plt.subplots(figsize=(FIG_SIZE_IN, 0.62 * FIG_SIZE_IN))
+    ax.scatter(
+        a[bound],
+        e[bound],
+        s=6,
+        alpha=0.45,
+        color="C0",
+        label=f"bound (e <= 1), n={int(bound.sum())}",
+    )
+    ax.scatter(
+        a[~bound],
+        e[~bound],
+        s=6,
+        alpha=0.45,
+        color="C1",
+        label=f"unbound (e > 1), n={int((~bound).sum())}",
+    )
+    ax.axhline(1.0, color="0.35", ls="--", lw=0.9, label="e = 1")
+    ax.set_xscale("log")
+    ax.set_yscale("symlog", linthresh=1.0)
+    ax.set_xlabel(r"$|a|/R_\mathrm{secondary}$")
+    ax.set_ylabel("eccentricity")
+    ax.set_title("All particle orbits relative to the primary")
+    ax.grid(alpha=0.25)
+    ax.legend(fontsize=8)
+    ax.text(
+        0.02,
+        0.98,
+        f"n={int(a.size)}, valid={int(valid.sum())}",
+        transform=ax.transAxes,
+        va="top",
+        fontsize=8,
+    )
+    fig.tight_layout()
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_eccentricity_scan(
+    data_path: str | Path,
+    out_path: str | Path,
+) -> None:
+    """Plot the median bound-ejecta eccentricity against impact parameter."""
+    data = np.load(data_path)
+    b = np.asarray(data["impact_parameter_r2"], float)
+    impact_index = np.asarray(data["ejecta_impact_index"], int)
+    e = np.asarray(data["ejecta_e"], float)
+    bound = np.asarray(data["ejecta_bound"], dtype=bool)
+
+    points: list[tuple[float, float, float, float, int]] = []
+    for index, value in enumerate(b):
+        values = e[(impact_index == index) & bound & np.isfinite(e)]
+        if values.size == 0:
+            continue
+        points.append(
+            (
+                float(value),
+                float(np.median(values)),
+                float(np.percentile(values, 16)),
+                float(np.percentile(values, 84)),
+                int(values.size),
+            )
+        )
+    if not points:
+        raise ValueError("no bound ejecta to plot against impact parameter")
+
+    x = np.asarray([point[0] for point in points])
+    median = np.asarray([point[1] for point in points])
+    low = np.asarray([point[2] for point in points])
+    high = np.asarray([point[3] for point in points])
+    fig, ax = plt.subplots(figsize=(FIG_SIZE_IN, 0.62 * FIG_SIZE_IN))
+    ax.errorbar(
+        x,
+        median,
+        yerr=np.vstack((median - low, high - median)),
+        fmt="o-",
+        color="C0",
+        capsize=2,
+        label="bound ejecta median (16-84%)",
+    )
+    ax.set_xlabel(r"impact parameter $b/R_\mathrm{secondary}$")
+    ax.set_ylabel("eccentricity")
+    ax.set_ylim(0.0, 1.0)
+    ax.set_title("Ring eccentricity vs impact parameter")
+    ax.grid(alpha=0.25)
+    ax.legend(fontsize=8)
+    fig.tight_layout()
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _kepler_radius_samples(a: float, e: float, n_samples: int) -> np.ndarray:
+    """Return time-uniform radii for one Keplerian ellipse."""
+    if a <= 0.0 or not 0.0 <= e < 1.0:
+        raise ValueError("Kepler samples require a > 0 and 0 <= e < 1")
+    if e == 0.0:
+        return np.full(n_samples, a, dtype=float)
+    mean_anomaly = 2.0 * np.pi * (np.arange(n_samples) + 0.5) / n_samples
+    eccentric_anomaly = mean_anomaly.copy()
+    for _ in range(12):
+        eccentric_anomaly -= (
+            eccentric_anomaly - e * np.sin(eccentric_anomaly) - mean_anomaly
+        ) / (1.0 - e * np.cos(eccentric_anomaly))
+    return a * (1.0 - e * np.cos(eccentric_anomaly))
+
+
+def plot_surface_density(
+    sim: rebound.Simulation,
+    out_path: str | Path,
+    *,
+    n_host: int,
+    n_secondary: int,
+    n_bullet: int,
+    secondary_radius: float,
+    primary_radius: float,
+    host_separation: float,
+    impact_parameter_r2: float,
+    diffusion: float = SURFACE_DENSITY_DIFFUSION,
+) -> dict[str, float]:
+    """
+    Smear bound ring particles over their Keplerian orbits and plot Sigma(R).
+
+    Each particle is sampled uniformly in orbital phase; its mass is split
+    equally over the samples, so the radial distribution conserves mass.
+    A Gaussian radial diffusion of `diffusion * secondary_radius` is applied
+    to the samples before histogramming.  Orbits whose pericentre is inside
+    the primary are excluded from the stable-ring profile.  The bottom x axis
+    is normalised by the initial binary separation; the top axis shows the
+    same radii in km.  The legend reports the number of ring particles used.
+    """
+    if diffusion < 0.0:
+        raise ValueError("surface-density diffusion must be non-negative")
+    stats = collision_product_stats(
+        sim,
+        n_host=n_host,
+        n_secondary=n_secondary,
+        n_bullet=n_bullet,
+    )
+    ring_mass = float(stats["mass_ring_kg"])
+    if stats["ring_indices"].size == 0:
+        raise ValueError("no bound ring particles for the surface-density profile")
+    if host_separation <= 0.0:
+        raise ValueError("initial binary separation must be positive")
+
+    orbital_a = np.asarray(stats["orbital_a_m"], float)
+    orbital_e = np.asarray(stats["orbital_e"], float)
+    bound = np.asarray(stats["orbital_bound"], dtype=bool)
+    a_ring = orbital_a[bound]
+    e_ring = orbital_e[bound]
+    masses_ring = np.asarray(stats["ring_masses_kg"], float)
+    if a_ring.size != masses_ring.size:
+        raise RuntimeError("ring mass and orbit arrays do not match")
+    stable = a_ring * (1.0 - e_ring) > primary_radius
+    a_ring = a_ring[stable]
+    e_ring = e_ring[stable]
+    masses_ring = masses_ring[stable]
+    if a_ring.size == 0:
+        raise ValueError("no stable ring orbits outside the primary")
+    ring_mass = float(masses_ring.sum())
+
+    rng = np.random.default_rng(42)
+    samples: list[np.ndarray] = []
+    weights: list[np.ndarray] = []
+    for a, e, mass in zip(a_ring, e_ring, masses_ring, strict=True):
+        radii: np.ndarray = _kepler_radius_samples(
+            float(a), float(e), SURFACE_DENSITY_SAMPLES
+        )
+        if diffusion > 0.0:
+            radii = np.asarray(
+                rng.normal(radii, diffusion * secondary_radius),
+                dtype=float,
+            )
+        radii = np.clip(radii, 1.0, None)
+        samples.append(radii)
+        weights.append(np.full(radii.size, mass / radii.size))
+    radii = np.concatenate(samples)
+    masses = np.concatenate(weights)
+    if not np.isclose(float(masses.sum()), ring_mass, rtol=1e-10):
+        raise RuntimeError("surface-density sampling did not conserve ring mass")
+
+    diffusion_width = diffusion * secondary_radius
+    r_lo = max(primary_radius, float(radii.min()) - 3.0 * diffusion_width)
+    r_hi = float(radii.max()) + 3.0 * diffusion_width
+    if r_hi <= r_lo:
+        raise ValueError("ring radius range is empty")
+    bins = np.linspace(r_lo, r_hi, SURFACE_DENSITY_BINS + 1)
+    hist, edges = np.histogram(radii, bins=bins, weights=masses)
+    centers = 0.5 * (edges[:-1] + edges[1:])
+    area = np.pi * (edges[1:] ** 2 - edges[:-1] ** 2)
+    sigma = hist / np.maximum(area, 1e-30)
+    peak = float(sigma.max())
+    if peak <= 0.0:
+        raise ValueError("surface-density profile is empty")
+    cumulative: np.ndarray = np.cumsum(hist)
+    if cumulative[-1] <= 0.0:
+        raise ValueError("surface-density profile is empty")
+    cumulative /= cumulative[-1]
+    r_in = float(centers[np.searchsorted(cumulative, 0.01)])
+    r_out = float(centers[np.searchsorted(cumulative, 0.99)])
+
+    data_path = Path(out_path).with_suffix(".npz")
+    atomic_savez(
+        data_path,
+        radius_m=centers,
+        sigma_kg_m2=sigma,
+        mass_kg=hist,
+        ring_mass_kg=np.array(ring_mass),
+        r_in_m=np.array(r_in),
+        r_out_m=np.array(r_out),
+        host_separation_m=np.array(host_separation),
+        impact_parameter_r2=np.array(impact_parameter_r2),
+        ring_particle_count=np.array(a_ring.size),
+    )
+    fig, ax = plt.subplots(figsize=(FIG_SIZE_IN, 0.62 * FIG_SIZE_IN))
+    positive = sigma > 0.0
+    x_norm = centers[positive] / host_separation
+    ax.plot(
+        x_norm,
+        sigma[positive],
+        color="C0",
+        lw=1.5,
+        label=(
+            f"ring profile (N={a_ring.size} particles, "
+            f"b/R_secondary={impact_parameter_r2:.2f})"
+        ),
+    )
+    ax.set_yscale("log")
+    ax.set_xlabel(r"$r / r_\mathrm{secondary\ host}$")
+    ax.set_ylabel(r"surface density $\Sigma$ [kg m$^{-2}$]")
+    ax.set_title(
+        "Smoothed ring surface-density profile "
+        f"(b/R_secondary={impact_parameter_r2:.2f})"
+    )
+    ax.grid(alpha=0.25)
+    ax.legend(loc="upper right", fontsize=8)
+    top = ax.secondary_xaxis(
+        "top",
+        functions=(
+            lambda value: value * host_separation / 1000.0,
+            lambda value: value * 1000.0 / host_separation,
+        ),
+    )
+    top.set_xlabel("radial distance from primary [km]")
+    ax.text(
+        0.02,
+        0.98,
+        f"ring mass={ring_mass:.3e} kg\n"
+        f"r=[{r_in / 1000:.2f}, {r_out / 1000:.2f}] km\n"
+        f"diffusion={diffusion:.3f} R_secondary",
+        transform=ax.transAxes,
+        va="top",
+        fontsize=8,
+    )
+    fig.tight_layout()
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    return {
+        "ring_mass_kg": ring_mass,
+        "r_in_m": r_in,
+        "r_out_m": r_out,
+        "sigma_peak_kg_m2": peak,
+    }
 
 
 def run_impact_scan(
@@ -2074,8 +2525,31 @@ def run_impact_scan(
     ejecta_bound: list[np.ndarray] = []
     a_bin = 0.0
 
+    contact_r2 = 1.0 + bullet_radius / secondary_radius
     for b_r2 in args.impact_parameters:
         b = float(b_r2) * secondary_radius
+        if abs(float(b_r2)) > contact_r2:
+            stats = no_contact_product_stats(
+                state2,
+                state3,
+                density=args.density,
+            )
+            row = {
+                "impact_parameter_m": b,
+                "impact_parameter_r2": float(b_r2),
+                **{
+                    key: value
+                    for key, value in stats.items()
+                    if not isinstance(value, np.ndarray)
+                },
+            }
+            rows.append(row)
+            log_info(
+                f"         b/R2={b_r2:5.2f}  no contact: "
+                "secondary intact, ring=debris=0"
+            )
+            continue
+
         sim, a_bin, _t_bin, t_impact, _n_host, _sep, _extent = build_scene_fixed(
             state1,
             state2,
@@ -2121,7 +2595,9 @@ def run_impact_scan(
             f"         b/R2={b_r2:5.2f}  "
             f"ring={stats['mass_ring_kg']:.3e} kg  "
             f"debris={stats['mass_debris_kg']:.3e} kg  "
-            f"secondary={stats['mass_secondary_kg']:.3e} kg"
+            f"secondary={stats['mass_secondary_kg']:.3e} kg  "
+            f"r=[{stats['ring_r_min_m'] / 1000:.1f}, "
+            f"{stats['ring_r_max_m'] / 1000:.1f}] km"
         )
 
     if not rows:
@@ -2139,6 +2615,8 @@ def run_impact_scan(
         mass_debris_kg=np.asarray([row["mass_debris_kg"] for row in rows]),
         mass_secondary_kg=np.asarray([row["mass_secondary_kg"] for row in rows]),
         mass_bullet_kg=np.asarray([row["mass_bullet_kg"] for row in rows]),
+        ring_r_min_m=np.asarray([row["ring_r_min_m"] for row in rows]),
+        ring_r_max_m=np.asarray([row["ring_r_max_m"] for row in rows]),
         ejecta_impact_index=np.asarray(ejecta_index, int),
         ejecta_a_m=cat(ejecta_a),
         ejecta_e=cat(ejecta_e),
@@ -2146,6 +2624,13 @@ def run_impact_scan(
         ejecta_valid=cat(ejecta_valid).astype(bool),
         ejecta_bound=cat(ejecta_bound).astype(bool),
     )
+    if args.eccentricity_scan_out is not None:
+        try:
+            plot_eccentricity_scan(data_path, args.eccentricity_scan_out)
+        except ValueError as exc:
+            log_warning(f"         eccentricity scan skipped: {exc}")
+        else:
+            log_info(f"         Eccentricity scan -> {args.eccentricity_scan_out}")
     payload = {
         **collect_metadata(),
         "run_id": run_id,
@@ -2598,9 +3083,25 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="directory for the run log (default: logs)",
     )
     parser.add_argument(
+        "--log-file",
+        type=str,
+        default=None,
+        help="explicit log path (default: unique file under --log-dir)",
+    )
+    parser.add_argument(
+        "--no-run-json",
+        action="store_true",
+        help="skip the per-run JSON manifest (case JSON is still written)",
+    )
+    parser.add_argument(
         "--list-settled",
         action="store_true",
         help="list the settled-body cache library and exit",
+    )
+    parser.add_argument(
+        "--settle-only",
+        action="store_true",
+        help="build/settle/reuse the three bodies and exit before any impact",
     )
     parser.add_argument(
         "--quiet",
@@ -2655,7 +3156,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=float,
         default=DEFAULT_IMPACT_PARAMETERS,
         metavar="B/R2",
-        help="impact parameters in units of the secondary host radius",
+        help="signed impact parameters in units of the secondary host radius",
     )
     parser.add_argument(
         "--impact-out",
@@ -2674,6 +3175,30 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=float,
         default=None,
         help="target impact parameter for a grouped case-scan selection",
+    )
+    parser.add_argument(
+        "--orbit-plot",
+        type=str,
+        default=None,
+        help="write an eccentricity vs semi-major-axis diagnostic",
+    )
+    parser.add_argument(
+        "--eccentricity-scan-out",
+        type=str,
+        default=None,
+        help="write bound-eccentricity vs impact parameter after --impact-scan",
+    )
+    parser.add_argument(
+        "--surface-density",
+        type=str,
+        default=None,
+        help="write a Keplerian-orbit surface-density profile",
+    )
+    parser.add_argument(
+        "--surface-density-diffusion",
+        type=float,
+        default=SURFACE_DENSITY_DIFFUSION,
+        help="Gaussian radial diffusion in units of the secondary radius",
     )
 
     parser.add_argument("--particles-per-body", type=int, default=None)
@@ -2707,10 +3232,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="fixed-geometry bullet speed in m/s (ignored with --param-path)",
     )
     parser.add_argument(
+        "--impact-parameter",
+        type=float,
+        default=0.0,
+        help=(
+            "signed b/R_secondary for one fixed-geometry case "
+            "(ignored with --param-path and --impact-scan)"
+        ),
+    )
+    parser.add_argument(
         "--post-impact-tail",
         type=float,
-        default=POST_IMPACT_TAIL,
-        help="simulation time after impact in seconds",
+        default=None,
+        help=(
+            "simulation time after impact in seconds "
+            f"(default {POST_IMPACT_TAIL:g}; GIF: {GIF_POST_IMPACT_TAIL:g})"
+        ),
     )
     parser.add_argument(
         "--steps-per-frame",
@@ -2779,6 +3316,7 @@ def main(argv: list[str] | None = None) -> None:
     _, log_path = setup_logging(
         "ringforge.main",
         log_dir=args.log_dir,
+        log_file=args.log_file,
         console_level=logging.WARNING if args.quiet else logging.INFO,
     )
     show_progress = not (args.quiet or args.no_progress)
@@ -2821,6 +3359,13 @@ def main(argv: list[str] | None = None) -> None:
             )
         return
 
+    if args.post_impact_tail is None:
+        long_tail = (
+            not args.no_media
+            and not args.impact_scan
+            and args.media_format in ("gif", "both")
+        )
+        args.post_impact_tail = GIF_POST_IMPACT_TAIL if long_tail else POST_IMPACT_TAIL
     if not 0.0 < args.view_percentile <= 100.0:
         raise SystemExit("--view-percentile must be in (0, 100]")
     if args.chunk_size <= 0:
@@ -2858,8 +3403,8 @@ def main(argv: list[str] | None = None) -> None:
     if args.impact_scan:
         if not args.impact_parameters:
             raise SystemExit("--impact-parameters must not be empty")
-        if any(not np.isfinite(b) or b < 0.0 for b in args.impact_parameters):
-            raise SystemExit("--impact-parameters must be finite and non-negative")
+        if any(not np.isfinite(b) for b in args.impact_parameters):
+            raise SystemExit("--impact-parameters must be finite")
         if Path(args.impact_out).suffix.lower() not in (".png", ".pdf"):
             raise SystemExit("--impact-out must end in .png or .pdf")
     if args.case_scan_out is not None:
@@ -2872,8 +3417,25 @@ def main(argv: list[str] | None = None) -> None:
     if args.case_scan_target is not None:
         if args.case_scan_out is None:
             raise SystemExit("--case-scan-target requires --case-scan-out")
-        if not np.isfinite(args.case_scan_target) or args.case_scan_target < 0.0:
-            raise SystemExit("--case-scan-target must be finite and non-negative")
+        if not np.isfinite(args.case_scan_target):
+            raise SystemExit("--case-scan-target must be finite")
+    if args.orbit_plot is not None:
+        if args.impact_scan:
+            raise SystemExit("--orbit-plot does not support --impact-scan")
+        if Path(args.orbit_plot).suffix.lower() not in (".png", ".pdf"):
+            raise SystemExit("--orbit-plot must end in .png or .pdf")
+    if args.eccentricity_scan_out is not None:
+        if not args.impact_scan:
+            raise SystemExit("--eccentricity-scan-out requires --impact-scan")
+        if Path(args.eccentricity_scan_out).suffix.lower() not in (".png", ".pdf"):
+            raise SystemExit("--eccentricity-scan-out must end in .png or .pdf")
+    if args.surface_density is not None:
+        if args.impact_scan:
+            raise SystemExit("--surface-density does not support --impact-scan")
+        if Path(args.surface_density).suffix.lower() not in (".png", ".pdf"):
+            raise SystemExit("--surface-density must end in .png or .pdf")
+    if args.surface_density_diffusion < 0.0:
+        raise SystemExit("--surface-density-diffusion must be non-negative")
 
     # resolve masses
     realisation: dict[str, Any] | None = None
@@ -3062,6 +3624,52 @@ def main(argv: list[str] | None = None) -> None:
 
     state1, state2, state3 = states
 
+    if args.settle_only:
+        log_info(
+            "\n         settle-only complete; "
+            "stopping before impact scene construction",
+        )
+        return
+
+    if (
+        realisation is not None
+        and args.case_scan_out is not None
+        and "impact_parameter_r2" in realisation
+    ):
+        b_r2 = float(realisation["impact_parameter_r2"])
+        contact_r2 = 1.0 + float(realisation["R_c"]) / float(realisation["R_b"])
+        if abs(b_r2) > contact_r2:
+            secondary_radius = float(realisation["R_b"])
+            bullet_radius = float(realisation["R_c"])
+            stats = no_contact_product_stats(state2, state3, density=args.density)
+            row = {
+                "impact_parameter_m": b_r2 * secondary_radius,
+                "impact_parameter_r2": b_r2,
+                "impact_target_r2": args.case_scan_target,
+                **{
+                    key: value
+                    for key, value in stats.items()
+                    if not isinstance(value, np.ndarray)
+                },
+            }
+            atomic_write_json(
+                Path(args.case_scan_out),
+                {
+                    "run_id": run_id,
+                    "realisation_index": chosen_index,
+                    "target_masses": list(target_masses),
+                    "n_particles": list(n_particles),
+                    "secondary_radius_m": secondary_radius,
+                    "bullet_radius_m": bullet_radius,
+                    "impact_row": row,
+                },
+            )
+            log_info(
+                f"         No contact at b/R_b={b_r2:.3f}; analytic row -> "
+                f"{args.case_scan_out}"
+            )
+            return
+
     if args.impact_scan:
         run_impact_scan(
             args,
@@ -3117,6 +3725,7 @@ def main(argv: list[str] | None = None) -> None:
             integrator=args.hit_integrator,
             softening=args.softening,
             bullet_speed=args.bullet_speed,
+            impact_parameter=float(args.impact_parameter) * body_radius(state2),
         )
         approach_time = t_impact
         t_max = 2.0 * approach_time + float(args.post_impact_tail)
@@ -3207,7 +3816,8 @@ def main(argv: list[str] | None = None) -> None:
         "lookback": actual_lookback,
     }
     manifest_path = DATA_DIR / f"run_{run_id}.json"
-    atomic_write_json(manifest_path, run_meta)
+    if not args.no_run_json:
+        atomic_write_json(manifest_path, run_meta)
 
     # integrate and render
     log_info("\nStage 3: run sim and cache frames")
@@ -3454,6 +4064,50 @@ def main(argv: list[str] | None = None) -> None:
         f"both={final_bound['f_bound_both']:.3f}",
     )
 
+    if args.surface_density is not None:
+        try:
+            profile = plot_surface_density(
+                sim,
+                args.surface_density,
+                n_host=n_particles[0],
+                n_secondary=n_particles[1],
+                n_bullet=n_particles[2],
+                secondary_radius=body_radius(state2),
+                primary_radius=(
+                    float(state1[0, 6]) if state1.shape[0] == 1 else body_radius(state1)
+                ),
+                host_separation=a_bin,
+                impact_parameter_r2=(
+                    float(realisation["impact_parameter_r2"])
+                    if realisation is not None and "impact_parameter_r2" in realisation
+                    else (
+                        float(realisation["b_contact"]) / body_radius(state2)
+                        if realisation is not None
+                        else float(args.impact_parameter)
+                    )
+                ),
+                diffusion=args.surface_density_diffusion,
+            )
+        except ValueError as exc:
+            log_warning(f"         surface-density profile skipped: {exc}")
+        else:
+            log_info(
+                f"         Surface density -> {args.surface_density}  "
+                f"r=[{profile['r_in_m'] / 1000:.2f}, "
+                f"{profile['r_out_m'] / 1000:.2f}] km"
+            )
+
+    if args.orbit_plot is not None:
+        plot_orbit_diagnostic(
+            sim,
+            args.orbit_plot,
+            n_host=n_particles[0],
+            n_secondary=n_particles[1],
+            n_bullet=n_particles[2],
+            secondary_radius=body_radius(state2),
+        )
+        log_info(f"         Orbit diagnostic -> {args.orbit_plot}")
+
     if args.case_scan_out is not None:
         if realisation is None:
             raise SystemExit("--case-scan-out requires a parameter-scan case")
@@ -3465,7 +4119,11 @@ def main(argv: list[str] | None = None) -> None:
             n_secondary=n_particles[1],
             n_bullet=n_particles[2],
         )
-        b_r2 = float(realisation["b_contact"]) / secondary_radius
+        b_r2 = (
+            float(realisation["impact_parameter_r2"])
+            if "impact_parameter_r2" in realisation
+            else float(realisation["b_contact"]) / secondary_radius
+        )
         row = {
             "impact_parameter_m": b_r2 * secondary_radius,
             "impact_parameter_r2": b_r2,
@@ -3532,7 +4190,8 @@ def main(argv: list[str] | None = None) -> None:
             "wall_time_s": time.perf_counter() - t0_wall,
         }
     )
-    atomic_write_json(manifest_path, run_meta)
+    if not args.no_run_json:
+        atomic_write_json(manifest_path, run_meta)
 
     if chunks_dir is not None and not args.keep_frames:
         log_info(

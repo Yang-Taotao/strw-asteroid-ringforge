@@ -1,0 +1,12 @@
+Sampling goodness-of-fit (KS tests; interpret p-values with care):
+            offset_dir.x: n=1000000, D=0.00061407, p=0.84489 (Uniform[-1, 1])
+            offset_dir.y: n=1000000, D=0.0011811, p=0.1227 (Uniform[-1, 1])
+            offset_dir.z: n=1000000, D=0.0011024, p=0.1757 (Uniform[-1, 1])
+            v_dir.x: n=1000000, D=0.0010866, p=0.18831 (Uniform[-1, 1])
+            v_dir.y: n=1000000, D=0.00098369, p=0.28771 (Uniform[-1, 1])
+            v_dir.z: n=1000000, D=0.0009864, p=0.28468 (Uniform[-1, 1])
+            cos_contact: n=1000000, D=0.05164, p=0 (Uniform[-1, 1])
+            cos_vrel: n=1000000, D=0.00040989, p=0.99602 (Uniform[-1, 1])
+            mu vs Uniform(0,1): n=1000000, D=0.43675, p=0
+            mu vs Beta(2,1)   : n=1000000, D=0.18808, p=0
+            mu prograde vs retrograde: n=568802/431198, D=0.0028177, p=0.04063 (fraction prograde=0.5688)
