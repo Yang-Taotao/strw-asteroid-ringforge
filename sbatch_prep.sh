@@ -1,36 +1,48 @@
-#!/usr/bin/env bash
-# Build/settle asteroids and generate param scan for each new experiment.
-# Run once before submitting jobs.
+#!/bin/bash
+#SBATCH --job-name=prep_impacts
+#SBATCH --export=ALL
+#SBATCH --output=logs/prep_%j.out
+#SBATCH --error=logs/prep_%j.err
+#SBATCH --mail-user="yangtaotao0524@gmail.com"
+#SBATCH --mail-type=BEGIN,END,FAIL
+#SBATCH --time=04:00:00
+#SBATCH --partition=cpu-zen4
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=32
+#SBATCH --mem=64G
+
+# Prepare the dust-collision experiments on a compute node:
+#   - settle the three bodies for each experiment
+#   - write the direct-b param_scan for each experiment
 #
-# Existing settled caches are reused.
-# Existing scan directories are skipped unless OVERWRITE_SCAN=1.
+# Submit from the repository root:
+#   sbatch sbatch_prep.sh
 #
-# Usage:
-#   ./prepare_experiments.sh
-#
-# Environment:
-#   N_SCAN=1000000, SCAN_WORKERS=32, SETTLE_TIME=108000, DT_SETTLE=10,
-#   SOFTENING=20, A_BIN=1e4, V_REL=100, OVERWRITE_SCAN=0.
+# Existing settled caches are reused. Existing scan directories are skipped
+# unless OVERWRITE_SCAN=1 (which replaces that scan directory).
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "$SCRIPT_DIR"
+module purge
+module load ALICE/default
+module load Miniforge3
 
-CONDA_ENV="${CONDA_ENV:-amuse-py313}"
+cd "${SLURM_SUBMIT_DIR:-$PWD}"
+
+if command -v conda >/dev/null 2>&1; then
+	source "$(conda info --base)/etc/profile.d/conda.sh"
+fi
+conda activate "${CONDA_ENV:-amuse-py313}"
+
+export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1
+export MPLCONFIGDIR="${MPLCONFIGDIR:-$PWD/.mplconfig}"
+mkdir -p "$MPLCONFIGDIR" logs media
+
 N_SCAN="${N_SCAN:-1000000}"
 SCAN_WORKERS="${SCAN_WORKERS:-32}"
 A_BIN="${A_BIN:-1e4}"
 V_REL="${V_REL:-100}"
-
-if ! command -v conda >/dev/null 2>&1; then
-	echo "conda is not on PATH" >&2
-	exit 1
-fi
-source "$(conda info --base)/etc/profile.d/conda.sh"
-conda activate "$CONDA_ENV"
-export MPLCONFIGDIR="${MPLCONFIGDIR:-$SCRIPT_DIR/.mplconfig}"
-mkdir -p "$MPLCONFIGDIR" logs
 
 targets=($(seq -f '%.2f' -2 0.01 2))
 
@@ -42,13 +54,16 @@ specs=(
 	"equal_icy|1e15|1e15|1e15|500"
 )
 
+echo "[$SHELL] prep on $(hostname), ${SLURM_CPUS_ON_NODE:-?} CPUs, ${SLURM_MEM_PER_NODE:-?} MB"
+echo "[$SHELL] scan: N=$N_SCAN workers=$SCAN_WORKERS impact values=${#targets[@]}"
+
 for spec in "${specs[@]}"; do
 	IFS='|' read -r tag m1 m2 m3 rho <<<"$spec"
 	scan="data/param_scan_${tag}"
 	echo
 	echo "=== ${tag}: M=(${m1}, ${m2}, ${m3}) kg  rho=${rho} kg/m3"
 
-	LOG_FILE="$SCRIPT_DIR/logs/settle_${tag}.log" \
+	LOG_FILE="$PWD/logs/settle_${tag}.log" \
 		M1="$m1" M2="$m2" M3="$m3" N1=1000 N2=1000 N3=1000 \
 		DENSITY="$rho" SETTLE_TIME="${SETTLE_TIME:-108000}" \
 		DT_SETTLE="${DT_SETTLE:-10}" SOFTENING="${SOFTENING:-20}" \
@@ -82,3 +97,4 @@ for spec in "${specs[@]}"; do
 	IFS='|' read -r tag _ _ _ _ <<<"$spec"
 	echo "  ${tag}: data/param_scan_${tag}"
 done
+echo "[$SHELL] done"
