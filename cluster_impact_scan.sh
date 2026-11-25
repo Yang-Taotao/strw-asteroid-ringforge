@@ -10,7 +10,7 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=20
 #SBATCH --cpus-per-task=1
-#SBATCH --mem-per-cpu=8G
+#SBATCH --mem-per-cpu=2G
 
 # Production impact scan:
 #   - 401 impact parameters, -2.00..2.00 step 0.01
