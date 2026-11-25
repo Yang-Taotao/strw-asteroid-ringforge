@@ -48,6 +48,10 @@ JSON_OUT="${JSON_OUT:-data/impact_scan_run_cases.json}"
 SURFACE_DENSITY_TARGET="${SURFACE_DENSITY_TARGET:-}"
 SURFACE_DENSITY_OUT="${SURFACE_DENSITY_OUT:-media/surface_density.png}"
 SURFACE_DENSITY_DIFFUSION="${SURFACE_DENSITY_DIFFUSION:-0.05}"
+SURFACE_TARGET=""
+if [[ -n "$SURFACE_DENSITY_TARGET" ]]; then
+	SURFACE_TARGET=$(printf '%.6f' "$SURFACE_DENSITY_TARGET")
+fi
 SELECTION="${CASE_DIR}/selection.tsv"
 LOG_FILE="${LOG_FILE:-logs/run_cases/batch_${CASE_SEED}_$(date +%Y%m%d_%H%M%S).log}"
 
@@ -76,12 +80,16 @@ run_one() {
 	local idx="$2"
 	local row="${CASE_DIR}/case_${idx}.json"
 	if [[ -s "$row" && -f "${row}.done" ]]; then
-		echo "=== [$(date +'%F %T')] skip   target=$target param-index=$idx"
-		return 0
+		if [[ -n "$SURFACE_TARGET" && "$target" == "$SURFACE_TARGET" && ! -e "$SURFACE_DENSITY_OUT" ]]; then
+			echo "=== [$(date +'%F %T')] surface missing; rerunning target=$target"
+		else
+			echo "=== [$(date +'%F %T')] skip   target=$target param-index=$idx"
+			return 0
+		fi
 	fi
 
 	local surface_args=()
-	if [[ -n "$SURFACE_DENSITY_TARGET" && "$target" == "$SURFACE_DENSITY_TARGET" ]]; then
+	if [[ -n "$SURFACE_TARGET" && "$target" == "$SURFACE_TARGET" ]]; then
 		surface_args=(
 			--surface-density "$SURFACE_DENSITY_OUT"
 			--surface-density-diffusion "$SURFACE_DENSITY_DIFFUSION"
@@ -118,7 +126,7 @@ run_one() {
 }
 
 export SCAN_DIR CASE_DIR CASE_SEED N_PARTICLES DENSITY POST_IMPACT_TAIL DT_HIT PLOT_OUT JSON_OUT
-export LOG_FILE SURFACE_DENSITY_TARGET SURFACE_DENSITY_OUT SURFACE_DENSITY_DIFFUSION
+export LOG_FILE SURFACE_TARGET SURFACE_DENSITY_TARGET SURFACE_DENSITY_OUT SURFACE_DENSITY_DIFFUSION
 export -f run_one
 
 TASKS=()
@@ -135,9 +143,15 @@ fi
 printf '%s\n' "${TASKS[@]}" |
 	xargs -P "$N_JOBS" -n 2 bash -c 'run_one "$1" "$2"' _
 
+MERGED_COUNT=$(find "$CASE_DIR" -maxdepth 1 -name 'case_*.json' | wc -l)
+if ((MERGED_COUNT == 0)); then
+	echo "no completed case rows in $CASE_DIR" >&2
+	exit 1
+fi
 echo "batch log: $LOG_FILE"
+echo "completed cases: $MERGED_COUNT / ${#TASKS[@]}"
 python case_scan.py merge \
 	--case-dir "$CASE_DIR" \
-	--count "$N_CASES" \
+	--count "$MERGED_COUNT" \
 	--out "$PLOT_OUT" \
 	--json-out "$JSON_OUT"
