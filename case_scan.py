@@ -5,7 +5,7 @@ Select parameter-scan cases and merge their impact-scan rows
     with `repeats` nearby realisations per target
 
 `merge` reads the per-case JSON rows
-    and draws the mean with min/max error bars at each target
+    and draws the median with a 16-84% band at each target
 """
 
 from __future__ import annotations

@@ -2074,39 +2074,64 @@ def plot_impact_scan(
             )
         return float(row[key]) / total
 
-    fig, ax = plt.subplots(figsize=(FIG_SIZE_IN, 0.62 * FIG_SIZE_IN))
+    fig, ax = plt.subplots(figsize=(1.2 * FIG_SIZE_IN, 0.65 * FIG_SIZE_IN))
     targets = [row.get("impact_target_r2") for row in rows]
     if all(target is not None for target in targets):
         target_values = np.asarray(targets, float)
-        for key, marker, color, label in series:
+        unique_targets = np.unique(target_values)
+        for key, _marker, color, label in series:
             y = np.asarray([normalised(row, key) for row in rows])
-            mean = np.asarray(
-                [y[target_values == value].mean() for value in np.unique(target_values)]
-            )
-            low = np.asarray(
-                [y[target_values == value].min() for value in np.unique(target_values)]
-            )
-            high = np.asarray(
-                [y[target_values == value].max() for value in np.unique(target_values)]
-            )
-            ax.errorbar(
-                np.unique(target_values),
-                mean,
-                yerr=np.vstack((mean - low, high - mean)),
-                fmt=marker,
+            centre = np.empty(unique_targets.size)
+            low = np.empty(unique_targets.size)
+            high = np.empty(unique_targets.size)
+            for i, value in enumerate(unique_targets):
+                sample = y[target_values == value]
+                low[i], centre[i], high[i] = np.nanpercentile(
+                    sample, [16.0, 50.0, 84.0]
+                )
+            ax.fill_between(
+                unique_targets,
+                low,
+                high,
                 color=color,
-                capsize=2,
-                label=label,
+                alpha=0.16,
+                linewidth=0,
+                zorder=1,
             )
-        b = target_values
+            ax.plot(
+                unique_targets,
+                low,
+                color=color,
+                lw=0.5,
+                alpha=0.55,
+                zorder=1.5,
+            )
+            ax.plot(
+                unique_targets,
+                high,
+                color=color,
+                lw=0.5,
+                alpha=0.55,
+                zorder=1.5,
+            )
+            ax.plot(
+                unique_targets,
+                centre,
+                color=color,
+                lw=1.5,
+                label=label,
+                zorder=2,
+            )
+        b = unique_targets
     else:
-        for key, marker, color, label in series:
+        for key, _marker, color, label in series:
             ax.plot(
                 b,
                 [normalised(row, key) for row in rows],
-                marker,
                 color=color,
+                lw=1.6,
                 label=label,
+                zorder=2,
             )
     contact = 1.0 + bullet_radius / secondary_radius
     contact_drawn = False
@@ -2123,8 +2148,15 @@ def plot_impact_scan(
     ax.set_xlabel(r"impact parameter $b/R_\mathrm{secondary}$")
     ax.set_ylabel(r"mass / $(M_\mathrm{secondary}+M_\mathrm{bullet})$")
     ax.set_title("Post impact mass analysis")
+    ax.set_xlim(float(b.min()), float(b.max()))
     ax.grid(alpha=0.25)
-    ax.legend(fontsize=8)
+    ax.legend(
+        loc="upper center",
+        bbox_to_anchor=(0.5, -0.12),
+        ncol=5,
+        fontsize=8,
+        frameon=False,
+    )
     ax.text(
         0.02,
         0.98,
@@ -2133,6 +2165,17 @@ def plot_impact_scan(
         va="top",
         fontsize=8,
     )
+    if all(target is not None for target in targets):
+        ax.text(
+            0.99,
+            0.02,
+            "line: median\nshaded: 16-84% of realisations\nthin: interval edges",
+            transform=ax.transAxes,
+            ha="right",
+            va="bottom",
+            fontsize=7,
+            color="0.35",
+        )
     fig.tight_layout()
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path, dpi=300, bbox_inches="tight")
